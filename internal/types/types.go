@@ -37,3 +37,31 @@ type PodMetrics struct {
 	RestartCount    int       `json:"restart_count"`
 	Timestamp       time.Time `json:"timestamp"`
 }
+
+// CPUPercent returns CPU usage as a percentage of its limit
+func (p *PodMetrics) CPUPercent() float64 {
+	if p.CPULimitMilli == 0 {
+		return 0
+	}
+	return (p.CPUUsageMilli / p.CPULimitMilli) * 100
+}
+
+// MemPercent returns memory usage as a percentage of its limit
+func (p *PodMetrics) MemPercent() float64 {
+	if p.MemLimitMB == 0 {
+		return 0
+	}
+	return (p.MemUsageMB / p.MemLimitMB) * 100
+}
+
+// holds aggregate resource info for a node
+type NodeMetrics struct {
+	NodeName         string    `json:"node_name"`
+	NodeType         string    `json:"node_type"` // eg . comput-optimized, memory-optimized, general
+	CPUCapacityMilli float64   `json:"cpu_capacity_milli"`
+	CPUUsedMilli     float64   `json:"cpu_used_milli"`
+	MemCapacityMb    float64   `json:"mem_capacity_mb"`
+	MemUsedMB        float64   `json:"mem_used_mb"`
+	PodCount         int       `json:"pod_count"`
+	Timestamp        time.Time `json:"timestamp"`
+}
