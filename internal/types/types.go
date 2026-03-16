@@ -20,3 +20,7 @@ const (
 	SeverityHigh     Severity = "high"
 	SeverityCritical Severity = "critical"
 )
+
+// PodMetrics holds realt-time resource usage for a single pod
+type PodMetrics struct {
+}
