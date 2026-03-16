@@ -65,3 +65,11 @@ type NodeMetrics struct {
 	PodCount         int       `json:"pod_count"`
 	Timestamp        time.Time `json:"timestamp"`
 }
+
+// CPUPressure returns CPU usage ration from 0.0 - 1.0, 0.8 means 80% of CPU is being used
+func (n *NodeMetrics) CPUPressure() float64 {
+	if n.CPUCapacityMilli == 0 {
+		return 0
+	}
+	return n.CPUUsedMilli / n.CPUCapacityMilli
+}
