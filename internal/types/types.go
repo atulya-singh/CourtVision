@@ -1,5 +1,7 @@
 package types
 
+import "time"
+
 // ActionType represents what the agent can do
 type ActionType string
 
@@ -23,4 +25,15 @@ const (
 
 // PodMetrics holds realt-time resource usage for a single pod
 type PodMetrics struct {
+	PodName         string    `json:"pod_name"`
+	Namespace       string    `json:"namespace"`
+	NodeName        string    `json:"node_name"`
+	CPUUsageMilli   float64   `json:"cpu_usage_milli"`   //millicores currently used
+	CPULimitMilli   float64   `json:"cpu_limit_milli"`   //millicores limit
+	CPURequestMilli float64   `json:"cpu_request_milli"` //millicores requested
+	MemUsageMB      float64   `json:"mem_usage_mb"`      //MB currently used
+	MemLimitMB      float64   `json:"mem_limit_mb"`      //MB limit
+	MemRequestMB    float64   `json:"mem_request_mb"`    //MB requested
+	RestartCount    int       `json:"restart_count"`
+	Timestamp       time.Time `json:"timestamp"`
 }
