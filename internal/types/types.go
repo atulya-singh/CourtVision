@@ -73,3 +73,27 @@ func (n *NodeMetrics) CPUPressure() float64 {
 	}
 	return n.CPUUsedMilli / n.CPUCapacityMilli
 }
+
+// Decision represents a single action the agent wants to take
+type Decision struct {
+	ID          string     `json:"id"`
+	Timestamp   time.Time  `json:"timestamp"`
+	Severity    Severity   `json:"severity"`
+	Action      ActionType `json:"action"`
+	TargetPod   string     `json:"target_pod"`
+	Namespace   string     `json:"namespace"`
+	TargetNode  string     `json:"target_node,omitempty"`   //
+	Reasoning   string     `json:"reasoning"`               //LLM's explanation
+	NewCPULimit float64    `json:"new_cpu_limit,omitempty"` //patch_limits
+	NewMemLimit float64    `json:"new_mem_limit,omitempty"` //for patch_limits
+	Executed    bool       `json:"executed"`
+	ExecutedAt  *time.Time `json:"executed_at,omitempty"`
+	Error       string     `json:"error,omitempty"`
+}
+
+// ClusterSnapshot is the full picture sent to the LLM for analysis
+type ClusterSnapshot struct {
+	Pods      []PodMetrics  `json:"pods"`
+	Nodes     []NodeMetrics `json:"nodes"`
+	Timestamp time.Time     `json:"timestamp"`
+}
