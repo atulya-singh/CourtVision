@@ -37,3 +37,30 @@ type podTemplate struct {
 	memReq    float64
 	noisy     bool // will this pode spike ?
 }
+
+func NewMockProvider() *MockProvider {
+	nodes := []nodeTemplate{
+		{"node-general-1", "general", 4000, 8192},
+		{"node-general-2", "general", 4000, 8192},
+		{"node-compute-1", "compute-optimized", 8000, 4096},
+		{"node-memory-1", "memory-optimized", 2000, 16384},
+	}
+
+	pods := []podTemplate{
+		// Normal well-behaved pods
+		{"api-server-7d4f", "production", "node-general-1", 200, 256, 500, 250, 512, 256, false},
+		{"auth-service-3b1a", "production", "node-general-1", 150, 128, 300, 200, 256, 128, false},
+		{"cache-redis-9c2e", "production", "node-general-2", 100, 512, 200, 100, 1024, 512, false},
+		{"worker-queue-5f8d", "production", "node-general-2", 300, 384, 500, 300, 512, 384, false},
+
+		// THE NOISY NEIGHBOR — a data pipeline that periodically spikes
+		{"data-pipeline-1a7c", "production", "node-general-1", 400, 300, 500, 400, 512, 300, true},
+
+		// Pods on specialized nodes
+		{"ml-training-8e3b", "ml-workloads", "node-compute-1", 2000, 1024, 4000, 2000, 2048, 1024, false},
+		{"feature-store-2d9f", "ml-workloads", "node-compute-1", 500, 512, 1000, 500, 1024, 512, false},
+		{"postgres-primary-6a1c", "databases", "node-memory-1", 400, 4096, 800, 400, 8192, 4096, false},
+	}
+
+	return &MockProvider{nodes: nodes, pods: pods}
+}
