@@ -12,3 +12,7 @@ type Store struct {
 	decisions []types.Decision
 	listeners []chan types.Decision // sse subscribers
 }
+
+func New() *Store {
+	return &Store{}
+}
