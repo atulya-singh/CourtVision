@@ -1,7 +1,10 @@
 package metrics
 
 import (
+	"math"
+	"math/rand"
 	"sync"
+	"time"
 
 	"github.com/atulya-singh/CourtVision/internal/types"
 )
@@ -63,4 +66,76 @@ func NewMockProvider() *MockProvider {
 	}
 
 	return &MockProvider{nodes: nodes, pods: pods}
+}
+
+func (m *MockProvider) GetClusterSnapshot() (*types.ClusterSnapshot, error) {
+	m.mu.Lock()
+	m.tick++
+	tick := m.tick
+	m.mu.Unlock()
+
+	now := time.Now()
+	snapshot := &types.ClusterSnapshot{Timestamp: now}
+
+	nodeUsage := make(map[string][2]float64) //node -> [cpuUsed, memUsed]
+
+	for _, pt := range m.pods {
+		pm := types.PodMetrics{
+			PodName:         pt.name,
+			Namespace:       pt.namespace,
+			NodeName:        pt.node,
+			CPULimitMilli:   pt.cpuLimit,
+			CPURequestMilli: pt.cpuReq,
+			MemLimitMB:      pt.memLimit,
+			MemRequestMB:    pt.memReq,
+			Timestamp:       now,
+		}
+
+		jitter := 0.9 + rand.Float64()*0.2
+
+		if pt.noisy {
+			spike := math.Sin(float64(tick)/6.0)*0.5 + 0.5 //0.0 to 1.0
+			cpuMultiplier := 1.0 + spike*1.5
+			pm.CPUUsageMilli = pt.baseCPU * cpuMultiplier * jitter
+			pm.MemUsageMB = pt.baseMem * (1.0 + spike*0.8) * jitter
+
+			if pm.CPUUsageMilli > pt.cpuLimit*1.5 {
+				pm.RestartCount = tick / 15
+			}
+		} else {
+			pm.CPUUsageMilli = pt.baseCPU * jitter
+			pm.MemUsageMB = pt.baseMem * jitter
+		}
+
+		snapshot.Pods = append(snapshot.Pods, pm)
+
+		//Accumulate node usage
+		u := nodeUsage[pt.node]
+		u[0] += pm.CPUUsageMilli
+		u[1] += pm.MemUsageMB
+		nodeUsage[pt.node] = u
+	}
+
+	for _, nt := range m.nodes {
+		usage := nodeUsage[nt.name]
+		podCount := 0
+		for _, pt := range m.pods {
+			if pt.node == nt.name {
+				podCount++
+			}
+		}
+
+		nm := types.NodeMetrics{
+			NodeName:         nt.name,
+			NodeType:         nt.nodeType,
+			CPUCapacityMilli: nt.cpuCap,
+			CPUUsedMilli:     usage[0],
+			MemCapacityMb:    nt.memCap,
+			MemUsedMB:        usage[1],
+			PodCount:         podCount,
+			Timestamp:        now,
+		}
+		snapshot.Nodes = append(snapshot.Nodes, nm)
+	}
+	return snapshot, nil
 }
