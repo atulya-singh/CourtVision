@@ -15,7 +15,7 @@ type RuleBasedEngine struct {
 	decisionCount int
 }
 
-func newRuleBasedEngine() *RuleBasedEngine {
+func NewRuleBasedEngine() *RuleBasedEngine {
 	return &RuleBasedEngine{}
 }
 
