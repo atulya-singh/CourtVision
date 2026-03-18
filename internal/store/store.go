@@ -8,7 +8,7 @@ import (
 
 type Store struct {
 	mu        sync.RWMutex
-	snapshot  types.ClusterSnapshot
+	snapshot  *types.ClusterSnapshot
 	decisions []types.Decision
-	listeners chan []types.Decision // sse subscribers
+	listeners []chan types.Decision // sse subscribers
 }
