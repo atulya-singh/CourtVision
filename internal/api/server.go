@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 
@@ -55,8 +56,60 @@ func (s *Server) handleCluster(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(snap)
 }
 
-func (s *Server) handleDecisions(w http.ResponseWriter, r *http.Request) {}
-func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request)       {}
+func (s *Server) handleDecisions(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	decisions := s.store.GetDecisions()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(decisions)
+}
+func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming not supported", http.StatusInternalServerError)
+		return
+	}
+	// Set SSE headers
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	ch := s.store.Subscribe()
+	defer s.store.Unsubscribe(ch)
+
+	log.Println("SSE client connected")
+
+	fmt.Fprintf(w, "event: connected\ndata: {\"status\":\"connected\"}\n\n")
+	flusher.Flush()
+
+	for {
+		select {
+		case decision, ok := <-ch:
+			if !ok {
+				// Channel was closed (store shutting down)
+				return
+			}
+			data, err := json.Marshal(decision)
+			if err != nil {
+				log.Printf("SSE marshal error: %v", err)
+				continue
+			}
+			// SSE format: "event: <type>\ndata: <json>\n\n"
+			fmt.Fprintf(w, "event: decision\ndata: %s\n\n", data)
+			flusher.Flush()
+
+		case <-r.Context().Done():
+			// Browser disconnected
+			log.Println("SSE client disconnected")
+			return
+		}
+	}
+}
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
