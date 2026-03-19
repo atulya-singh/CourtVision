@@ -1,15 +1,13 @@
 package main
 
 import (
-	"encoding/json"
-	"fmt"
 	"log"
-	"os"
 	"time"
 
+	"github.com/atulya-singh/CourtVision/internal/api"
 	"github.com/atulya-singh/CourtVision/internal/decision"
 	"github.com/atulya-singh/CourtVision/internal/metrics"
-	"github.com/atulya-singh/CourtVision/internal/types"
+	"github.com/atulya-singh/CourtVision/internal/store"
 )
 
 func main() {
@@ -19,34 +17,32 @@ func main() {
 	log.Println("Starting Agentic Infrastructure Monitor")
 	log.Println("---")
 	//constructors
+	st := store.New()
 	provider := metrics.NewMockProvider()
 	engine := decision.NewRuleBasedEngine()
 
-	//decision log
-	var allDecisions []types.Decision
+	go monitorLoop(provider, engine, st)
 
-	// Main monitoring loop
-	interval := 5 * time.Second // slow interval
-	if len(os.Args) > 1 && os.Args[1] == "--fast" {
-		interval = 1 * time.Second // speed up the loop if the user asked.
-	}
-	ticker := time.NewTicker(interval) // creating a ticker that ticks between the specified interval
+	server := api.NewServer(st, "8080")
+	log.Fatal(server.Start())
+}
+
+func monitorLoop(provider metrics.Provider, engine decision.Engine, st *store.Store) {
+	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 
-	maxCycles := 10
-	cycle := 0
+	log.Println("Monitor loop started (every 3 seconds)")
 
 	for range ticker.C {
-		cycle++
-		log.Printf("=== Cycle %d/%d ===", cycle, maxCycles)
+		// 1. Collect metrics snapshot
 
 		snapshot, err := provider.GetClusterSnapshot()
 		if err != nil {
-			log.Printf("ERROR: %V", err)
-			continue // skip to the next cycle
+			log.Printf("ERROR collecting metrics: %v", err)
+			continue
 		}
-
-		printClusterSummary(snapshot)
+		// 2. Store the snapshot (API can now serve it)
+		st.SetSnapshot(snapshot)
 
 		decisions, err := engine.Analyze(snapshot)
 		if err != nil {
@@ -54,62 +50,12 @@ func main() {
 			continue
 		}
 
+		for _, d := range decisions {
+			st.AddDecision(d)
+			log.Printf("Decision: [%s] %s -> %s", d.Severity, d.TargetPod, d.Action)
+		}
 		if len(decisions) == 0 {
-			log.Printf(" No issues detected")
-		} else {
-			for _, d := range decisions {
-				printDecision(&d)
-				allDecisions = append(allDecisions, d)
-			}
-		}
-		fmt.Println()
-
-		if cycle >= maxCycles {
-			break
+			log.Println("Cycle complete - no issues")
 		}
 	}
-	log.Println("=== Session Summary ===")
-	log.Printf("Total decisions: %d", len(allDecisions))
-
-	actionCounts := make(map[types.ActionType]int)
-	for _, d := range allDecisions {
-		actionCounts[d.Action]++
-	}
-	for action, count := range actionCounts {
-		log.Printf("  %s: %d", action, count)
-	}
-
-	// Dump decisions as JSON for later use
-	if len(allDecisions) > 0 {
-		data, _ := json.MarshalIndent(allDecisions, "", "  ")
-		os.WriteFile("decisions.json", data, 0644)
-		log.Println("Decisions written to decisions.json")
-	}
-}
-
-func printClusterSummary(s *types.ClusterSnapshot) {
-	for _, n := range s.Nodes {
-		log.Printf("  Node %-20s [%s] CPU: %5.0f/%5.0fm (%.0f%%)  Mem: %5.0f/%5.0fMB  Pods: %d",
-			n.NodeName, n.NodeType,
-			n.CPUUsedMilli, n.CPUCapacityMilli, n.CPUPressure()*100,
-			n.MemUsedMB, n.MemCapacityMb, n.PodCount,
-		)
-	}
-}
-
-func printDecision(d *types.Decision) {
-	icon := "⚡"
-	switch d.Severity {
-	case types.SeverityCritical:
-		icon = "🚨"
-	case types.SeverityHigh:
-		icon = "🔴"
-	case types.SeverityMedium:
-		icon = "🟡"
-	case types.SeverityLow:
-		icon = "🟢"
-	}
-
-	log.Printf("  %s [%s] %s → %s", icon, d.Severity, d.TargetPod, d.Action)
-	log.Printf("    Reasoning: %s", d.Reasoning)
 }
