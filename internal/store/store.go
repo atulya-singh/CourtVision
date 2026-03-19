@@ -45,3 +45,37 @@ func (s *Store) AddDecision(d types.Decision) {
 	}
 	s.mu.Unlock()
 }
+
+func (s *Store) GetDecisions() []types.Decision {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	out := make([]types.Decision, len(s.decisions))
+	copy(out, s.decisions)
+	return out
+}
+
+//Subscribe creates a new SSE Listener channel
+// The caller reads from this channel to get real time decisions
+
+func (s *Store) Subscribe() chan types.Decision {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ch := make(chan types.Decision, 20)
+	s.listeners = append(s.listeners, ch)
+	return ch
+}
+
+func (s *Store) Unsubscribe(ch chan types.Decision) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for i, listener := range s.listeners {
+		if listener == ch {
+			s.listeners = append(s.listeners[:i], s.listeners[i+1:]...)
+			close(ch)
+			return
+		}
+	}
+}
