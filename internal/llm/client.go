@@ -91,6 +91,5 @@ func (c *Client) Generate(prompt string) (string, error) {
 	if err := json.Unmarshal(body, &ollamaResp); err != nil {
 		return "", fmt.Errorf("failed to parse response: %w", err)
 	}
-
 	return ollamaResp.Response, nil
 }
