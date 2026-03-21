@@ -44,6 +44,7 @@ func ParseResponse(raw string) ([]types.Decision, error) {
 		if !strings.HasPrefix(line, "{") {
 			continue
 		}
+
 		var ld llmDecision
 		if err := json.Unmarshal([]byte(line), &ld); err != nil {
 			// BAD JSON - skip this line, try the next line\
