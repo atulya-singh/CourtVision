@@ -42,6 +42,7 @@ func ParseResponse(raw string) ([]types.Decision, error) {
 
 		// skip lines that aren't JSON
 		if !strings.HasPrefix(line, "{") {
+
 			continue
 		}
 
