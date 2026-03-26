@@ -2,12 +2,15 @@ package main
 
 import (
 	"log"
+	"os"
 	"time"
 
 	"github.com/atulya-singh/CourtVision/internal/api"
 	"github.com/atulya-singh/CourtVision/internal/decision"
+	"github.com/atulya-singh/CourtVision/internal/llm"
 	"github.com/atulya-singh/CourtVision/internal/metrics"
 	"github.com/atulya-singh/CourtVision/internal/store"
+	"github.com/atulya-singh/CourtVision/internal/types"
 )
 
 func main() {
@@ -19,12 +22,29 @@ func main() {
 	//constructors
 	st := store.New()
 	provider := metrics.NewMockProvider()
-	engine := decision.NewRuleBasedEngine()
+
+	ollamaURL := os.Getenv("OLLAMA_URL")
+	if ollamaURL == "" {
+		ollamaURL = "https://localhost:11434"
+	}
+
+	model := os.Getenv("OLLAMA_MODEL")
+	if model == "" {
+		model = "llama3"
+	}
+
+	log.Printf("Connecting to Ollama at %s (model: %s)", ollamaURL, model)
+	llmClient := llm.NewClient(ollamaURL, model)
+	engine := llm.NewEngine(llmClient)
 
 	go monitorLoop(provider, engine, st)
 
 	server := api.NewServer(st, "8080")
 	log.Fatal(server.Start())
+}
+
+type analyzer interface {
+	Analyze(snapshot *types.ClusterSnapshot) ([]types.Decision, error)
 }
 
 func monitorLoop(provider metrics.Provider, engine decision.Engine, st *store.Store) {
