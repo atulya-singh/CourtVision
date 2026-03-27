@@ -14,6 +14,15 @@ interface Decision {
   error?: string
 }
 
+type DecisionStatus = 'pending' | 'approved' | 'rejected'
+
+function getStatus(d: Decision): DecisionStatus {
+  if (d.executed_at && d.error === 'rejected by operator') return 'rejected'
+  if (d.executed_at && d.executed) return 'approved'
+  if (d.executed) return 'approved'
+  return 'pending'
+}
+
 const severityStyles: Record<string, string> = {
   critical: 'bg-red-500/20 text-red-400 border-red-500/40',
   high: 'bg-orange-500/20 text-orange-400 border-orange-500/40',
@@ -33,8 +42,35 @@ function SeverityBadge({ severity }: { severity: string }) {
   )
 }
 
-function DecisionCard({ decision, isNew }: { decision: Decision; isNew: boolean }) {
+function StatusBadge({ status }: { status: DecisionStatus }) {
+  if (status === 'approved') {
+    return (
+      <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-green-500/20 text-green-400 border border-green-500/40">
+        APPROVED
+      </span>
+    )
+  }
+  if (status === 'rejected') {
+    return (
+      <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-red-500/20 text-red-400 border border-red-500/40">
+        REJECTED
+      </span>
+    )
+  }
+  return null
+}
+
+function DecisionCard({
+  decision,
+  isNew,
+  onAction,
+}: {
+  decision: Decision
+  isNew: boolean
+  onAction: (id: string, action: 'approve' | 'reject') => void
+}) {
   const time = new Date(decision.timestamp).toLocaleTimeString()
+  const status = getStatus(decision)
 
   return (
     <div
@@ -43,14 +79,33 @@ function DecisionCard({ decision, isNew }: { decision: Decision; isNew: boolean 
       }`}
     >
       <div className="flex items-center justify-between mb-2">
-        <SeverityBadge severity={decision.severity} />
+        <div className="flex items-center gap-2">
+          <SeverityBadge severity={decision.severity} />
+          <StatusBadge status={status} />
+        </div>
         <span className="text-xs text-gray-500">{time}</span>
       </div>
       <div className="mb-2">
         <span className="text-white font-medium">{decision.target_pod}</span>
         <span className="text-gray-500 text-sm ml-2">{decision.action.replace(/_/g, ' ')}</span>
       </div>
-      <p className="text-sm text-gray-400 leading-relaxed">{decision.reasoning}</p>
+      <p className="text-sm text-gray-400 leading-relaxed mb-3">{decision.reasoning}</p>
+      {status === 'pending' && (
+        <div className="flex gap-2">
+          <button
+            onClick={() => onAction(decision.id, 'approve')}
+            className="px-3 py-1 text-xs font-medium rounded-lg bg-green-500/20 text-green-400 border border-green-500/30 hover:bg-green-500/30 transition-colors cursor-pointer"
+          >
+            Approve
+          </button>
+          <button
+            onClick={() => onAction(decision.id, 'reject')}
+            className="px-3 py-1 text-xs font-medium rounded-lg bg-red-500/20 text-red-400 border border-red-500/30 hover:bg-red-500/30 transition-colors cursor-pointer"
+          >
+            Reject
+          </button>
+        </div>
+      )}
     </div>
   )
 }
@@ -82,7 +137,6 @@ export default function DecisionFeed() {
       const decision: Decision = JSON.parse(e.data)
       newIdsRef.current.add(decision.id)
       setDecisions((prev) => [decision, ...prev])
-      // Remove from "new" set after animation completes
       setTimeout(() => newIdsRef.current.delete(decision.id), 600)
     })
 
@@ -91,6 +145,24 @@ export default function DecisionFeed() {
 
     return () => es.close()
   }, [])
+
+  const handleAction = (id: string, action: 'approve' | 'reject') => {
+    fetch(`/api/decisions/${id}/${action}`, { method: 'POST' })
+      .then((r) => {
+        if (!r.ok) throw new Error('Failed')
+        setDecisions((prev) =>
+          prev.map((d) => {
+            if (d.id !== id) return d
+            const now = new Date().toISOString()
+            if (action === 'approve') {
+              return { ...d, executed: true, executed_at: now }
+            }
+            return { ...d, executed: false, executed_at: now, error: 'rejected by operator' }
+          })
+        )
+      })
+      .catch(console.error)
+  }
 
   return (
     <div>
@@ -110,7 +182,12 @@ export default function DecisionFeed() {
           <div className="text-gray-500 text-center py-8">No decisions yet</div>
         ) : (
           decisions.map((d) => (
-            <DecisionCard key={d.id} decision={d} isNew={newIdsRef.current.has(d.id)} />
+            <DecisionCard
+              key={d.id}
+              decision={d}
+              isNew={newIdsRef.current.has(d.id)}
+              onAction={handleAction}
+            />
           ))
         )}
       </div>

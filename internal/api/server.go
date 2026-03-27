@@ -5,8 +5,11 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
+	"time"
 
 	"github.com/atulya-singh/CourtVision/internal/store"
+	"github.com/atulya-singh/CourtVision/internal/types"
 )
 
 // Server holds the HTTP server and its dependencies
@@ -27,6 +30,8 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/cluster", s.handleCluster)
 	mux.HandleFunc("/api/decisions", s.handleDecisions)
 	mux.HandleFunc("/api/events", s.handleSSE)
+
+	mux.HandleFunc("/api/decisions/", s.handleDecisionAction)
 
 	// Health check
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
@@ -110,10 +115,50 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 }
+func (s *Server) handleDecisionAction(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Parse: /api/decisions/{id}/approve or /api/decisions/{id}/reject
+	path := strings.TrimPrefix(r.URL.Path, "/api/decisions/")
+	parts := strings.Split(path, "/")
+	if len(parts) != 2 {
+		http.Error(w, "invalid path", http.StatusBadRequest)
+		return
+	}
+
+	id := parts[0]
+	action := parts[1]
+
+	if action != "approve" && action != "reject" {
+		http.Error(w, "action must be 'approve' or 'reject'", http.StatusBadRequest)
+		return
+	}
+
+	now := time.Now()
+	found := s.store.UpdateDecision(id, func(d *types.Decision) {
+		d.Executed = action == "approve"
+		d.ExecutedAt = &now
+		if action == "reject" {
+			d.Error = "rejected by operator"
+		}
+	})
+
+	if !found {
+		http.Error(w, "decision not found", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": action + "d"})
+}
+
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 
 		// Handle preflight requests

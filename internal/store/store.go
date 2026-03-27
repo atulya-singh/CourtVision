@@ -67,6 +67,20 @@ func (s *Store) Subscribe() chan types.Decision {
 	return ch
 }
 
+// UpdateDecision finds a decision by ID and applies the update function
+func (s *Store) UpdateDecision(id string, update func(*types.Decision)) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for i := range s.decisions {
+		if s.decisions[i].ID == id {
+			update(&s.decisions[i])
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Store) Unsubscribe(ch chan types.Decision) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
