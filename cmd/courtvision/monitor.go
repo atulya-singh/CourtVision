@@ -22,6 +22,7 @@ func monitorCmd() *cobra.Command {
 		ollamaURL  string
 		model      string
 		metricsStr string
+		namespace  string
 		interval   time.Duration
 		dryRun     bool
 	)
@@ -61,8 +62,11 @@ with SSE for real-time updates.`,
 				provider = metrics.NewMockProvider()
 			case "k8s":
 				log.Println("Using Kubernetes metrics provider")
-				// provider = metrics.NewK8sProvider() ← uncomment when you build this
-				return fmt.Errorf("k8s metrics not implemented yet — use --metrics mock")
+				var err error
+				provider, err = metrics.NewK8sProvider(namespace)
+				if err != nil {
+					return fmt.Errorf("failed to create k8s provider: %w", err)
+				}
 			default:
 				return fmt.Errorf("unknown metrics source: %s (use 'mock' or 'k8s')", metricsStr)
 			}
@@ -85,6 +89,7 @@ with SSE for real-time updates.`,
 	cmd.Flags().StringVar(&ollamaURL, "ollama-url", "http://localhost:11434", "Ollama server URL")
 	cmd.Flags().StringVar(&model, "model", "llama3", "LLM model name")
 	cmd.Flags().StringVar(&metricsStr, "metrics", "mock", "Metrics source (mock or k8s)")
+	cmd.Flags().StringVar(&namespace, "namespace", "", "Kubernetes namespace to monitor (empty for all namespaces)")
 	cmd.Flags().DurationVar(&interval, "interval", 3*time.Second, "Monitoring loop interval")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", true, "Log decisions without executing them")
 
