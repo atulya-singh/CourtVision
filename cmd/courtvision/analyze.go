@@ -1,7 +1,10 @@
 package main
 
 import (
+	"encoding/json"
+	"fmt"
 	"log"
+	"strings"
 
 	"github.com/spf13/cobra"
 )
@@ -62,7 +65,56 @@ AI-powered analysis.`,
 			// default:
 			//     return fmt.Errorf("unknown output format: %s (use 'json' or 'table')", output)
 			// }
-
+			// PLACEHOLDER — remove when you uncomment above
+			fmt.Println("Analysis would run here")
+			fmt.Printf("  Metrics: %s, Model: %s, Output: %s\n", metricsStr, model, output)
+			return nil
 		},
 	}
+	// Default values for the variables if user doesnt enter anything
+	cmd.Flags().StringVar(&ollamaURL, "ollama-url", "http://localhost:11434", "Ollama server URL")
+	cmd.Flags().StringVar(&model, "model", "llama3", "LLM model name")
+	cmd.Flags().StringVar(&metricsStr, "metrics", "mock", "Metrics source (mock or k8s)")
+	cmd.Flags().StringVar(&output, "output", "table", "Output format (table or json)")
+
+	return cmd
+}
+
+// printJSON outputs decisions as pretty-printed JSON
+func printJSON(decisions interface{}) error {
+	data, err := json.MarshalIndent(decisions, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to format JSON: %w", err)
+	}
+	fmt.Println(string(data))
+	return nil
+}
+
+// printTable outputs decisions as a formatted ASCII table
+func printTable(decisions interface{}) error {
+	// We use interface{} here as placeholder — in your real code,
+	// this would accept []types.Decision
+
+	// Table header
+	fmt.Println()
+	fmt.Printf("  %-10s %-25s %-15s %s\n", "SEVERITY", "POD", "ACTION", "REASONING")
+	fmt.Printf("  %-10s %-25s %-15s %s\n",
+		strings.Repeat("─", 10),
+		strings.Repeat("─", 25),
+		strings.Repeat("─", 15),
+		strings.Repeat("─", 50),
+	)
+
+	// PLACEHOLDER — in your real code, loop through decisions:
+	// for _, d := range decisions {
+	//     reasoning := d.Reasoning
+	//     if len(reasoning) > 50 {
+	//         reasoning = reasoning[:47] + "..."
+	//     }
+	//     fmt.Printf("  %-10s %-25s %-15s %s\n",
+	//         d.Severity, d.TargetPod, d.Action, reasoning)
+	// }
+
+	fmt.Println()
+	return nil
 }
