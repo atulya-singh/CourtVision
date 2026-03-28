@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/atulya-singh/CourtVision/internal/types"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
@@ -142,47 +143,49 @@ func (k *K8sProvider) GetClusterSnapshot() (*types.ClusterSnapshot, error) {
 	}
 
 	for _, pod := range podList.Items {
-		if pod.Status.Phase != "running" {
+		if pod.Status.Phase != corev1.PodRunning {
 			continue
 		}
 
 		var cpuRequest, cpuLimit, memRequest, memLimit float64
-		var totalRestarts int
 
 		for _, container := range pod.Spec.Containers {
-			if req, ok := container.Resources.Requests["cpu"]; ok {
-				cpuRequest += float64(req.Value()) / (1024 * 1024)
+			if req, ok := container.Resources.Requests[corev1.ResourceCPU]; ok {
+				cpuRequest += float64(req.MilliValue())
 			}
-			if req, ok := container.Resources.Requests["memory"]; ok {
+			if req, ok := container.Resources.Requests[corev1.ResourceMemory]; ok {
 				memRequest += float64(req.Value()) / (1024 * 1024)
 			}
-			if lim, ok := container.Resources.Limits["cpu"]; ok {
+			if lim, ok := container.Resources.Limits[corev1.ResourceCPU]; ok {
 				cpuLimit += float64(lim.MilliValue())
 			}
-			if lim, ok := container.Resources.Limits["memory"]; ok {
+			if lim, ok := container.Resources.Limits[corev1.ResourceMemory]; ok {
 				memLimit += float64(lim.Value()) / (1024 * 1024)
 			}
-
-			for _, cs := range pod.Status.ContainerStatuses {
-				totalRestarts += int(cs.RestartCount)
-			}
-
-			key := pod.Namespace + "/" + pod.Name
-			usage := podUsageMap[key]
-			pm := types.PodMetrics{
-				PodName:         pod.Name,
-				Namespace:       pod.Namespace,
-				NodeName:        pod.Spec.NodeName,
-				CPUUsageMilli:   usage[0],
-				CPULimitMilli:   cpuLimit,
-				CPURequestMilli: cpuRequest,
-				MemUsageMB:      usage[1],
-				MemLimitMB:      memLimit,
-				MemRequestMB:    memRequest,
-				RestartCount:    totalRestarts,
-				Timestamp:       now,
-			}
-			snapshot.Pods = append(snapshot.Pods, pm)
 		}
-		return snapshot, nil
+
+		var totalRestarts int
+		for _, cs := range pod.Status.ContainerStatuses {
+			totalRestarts += int(cs.RestartCount)
+		}
+
+		key := pod.Namespace + "/" + pod.Name
+		usage := podUsageMap[key]
+		pm := types.PodMetrics{
+			PodName:         pod.Name,
+			Namespace:       pod.Namespace,
+			NodeName:        pod.Spec.NodeName,
+			CPUUsageMilli:   usage[0],
+			CPULimitMilli:   cpuLimit,
+			CPURequestMilli: cpuRequest,
+			MemUsageMB:      usage[1],
+			MemLimitMB:      memLimit,
+			MemRequestMB:    memRequest,
+			RestartCount:    totalRestarts,
+			Timestamp:       now,
+		}
+		snapshot.Pods = append(snapshot.Pods, pm)
 	}
+
+	return snapshot, nil
+}
