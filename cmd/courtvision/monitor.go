@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"time"
 
@@ -43,6 +44,39 @@ with SSE for real-time updates.`,
 			log.Printf("  Interval: %s", interval)
 			log.Printf("  Dry run:  %v", dryRun)
 			log.Println("---")
+
+			// st := store.New()
+
+			// Choose metrics provider based on flag
+			switch metricsStr {
+			case "mock":
+				log.Println("Using mock metrics provider")
+				// provider = metrics.NewMockProvider()
+			case "k8s":
+				// provider = metrics.NewK8sProvider()
+			default:
+				return fmt.Errorf("unknown metrics source: %s (use 'mock' or 'k8s')", metricsStr)
+			}
+			// llmClient := llm.NewClient(ollamaURL, model)
+			// engine := llm.NewEngine(llmClient)
+
+			// go monitorLoop(provider, engine, st, interval)
+
+			// server := api.NewServer(st, port)
+			// return server.Start()
+
+			// PLACEHOLDER — remove this when you uncomment the real code above
+			log.Printf("Monitor would start here (port %s, interval %s)", port, interval)
+			select {} // block forever
 		},
 	}
+	// Register flags on this command
+	cmd.Flags().StringVar(&port, "port", "8080", "API server port")
+	cmd.Flags().StringVar(&ollamaURL, "ollama-url", "http://localhost:11434", "Ollama server URL")
+	cmd.Flags().StringVar(&model, "model", "llama3", "LLM model name")
+	cmd.Flags().StringVar(&metricsStr, "metrics", "mock", "Metrics source (mock or k8s)")
+	cmd.Flags().DurationVar(&interval, "interval", 3*time.Second, "Monitoring loop interval")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", true, "Log decisions without executing them")
+
+	return cmd
 }
