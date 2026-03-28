@@ -18,6 +18,7 @@ func analyzeCmd() *cobra.Command {
 		model      string
 		metricsStr string
 		output     string
+		namespace  string
 	)
 
 	cmd := &cobra.Command{
@@ -75,6 +76,7 @@ AI-powered analysis.`,
 	cmd.Flags().StringVar(&model, "model", "llama3", "LLM model name")
 	cmd.Flags().StringVar(&metricsStr, "metrics", "mock", "Metrics source (mock or k8s)")
 	cmd.Flags().StringVar(&output, "output", "table", "Output format (table or json)")
+	cmd.Flags().StringVar(&namespace, "namespace", "", "Kubernetes namespace to watch (empty = all)")
 
 	return cmd
 }
