@@ -105,4 +105,84 @@ func (k *K8sProvider) GetClusterSnapshot() (*types.ClusterSnapshot, error) {
 		podUsageMap[key] = [2]float64{cpuMillis, memMB}
 	}
 
-}
+	snapshot := &types.ClusterSnapshot{Timestamp: now}
+
+	// Counting total number of pods on each node
+	podCountPerNode := make(map[string]int)
+	for _, pod := range podList.Items {
+		podCountPerNode[pod.Spec.NodeName]++
+	}
+
+	for _, node := range nodeList.Items {
+		cpuCapacity := float64(node.Status.Allocatable.Cpu().MilliValue())
+		memCapacity := float64(node.Status.Allocatable.Memory().Value()) / (1024 * 1024)
+
+		usage := nodeUsageMap[node.Name]
+
+		nodeType := "general"
+		if instanceType, ok := node.Labels["node.kubernetes.io/instance-typ"]; ok {
+			nodeType = instanceType
+		}
+
+		if instanceType, ok := node.Labels["beta.kubernetes.io/instance-type"]; ok {
+			nodeType = instanceType
+		}
+
+		nm := types.NodeMetrics{
+			NodeName:         node.Name,
+			NodeType:         nodeType,
+			CPUCapacityMilli: cpuCapacity,
+			CPUUsedMilli:     usage[0],
+			MemCapacityMb:    memCapacity,
+			MemUsedMB:        usage[1],
+			PodCount:         podCountPerNode[node.Name],
+			Timestamp:        now,
+		}
+		snapshot.Nodes = append(snapshot.Nodes, nm)
+	}
+
+	for _, pod := range podList.Items {
+		if pod.Status.Phase != "running" {
+			continue
+		}
+
+		var cpuRequest, cpuLimit, memRequest, memLimit float64
+		var totalRestarts int
+
+		for _, container := range pod.Spec.Containers {
+			if req, ok := container.Resources.Requests["cpu"]; ok {
+				cpuRequest += float64(req.Value()) / (1024 * 1024)
+			}
+			if req, ok := container.Resources.Requests["memory"]; ok {
+				memRequest += float64(req.Value()) / (1024 * 1024)
+			}
+			if lim, ok := container.Resources.Limits["cpu"]; ok {
+				cpuLimit += float64(lim.MilliValue())
+			}
+			if lim, ok := container.Resources.Limits["memory"]; ok {
+				memLimit += float64(lim.Value()) / (1024 * 1024)
+			}
+
+			for _, cs := range pod.Status.ContainerStatuses {
+				totalRestarts += int(cs.RestartCount)
+			}
+
+			key := pod.Namespace + "/" + pod.Name
+			usage := podUsageMap[key]
+			pm := types.PodMetrics{
+				PodName:         pod.Name,
+				Namespace:       pod.Namespace,
+				NodeName:        pod.Spec.NodeName,
+				CPUUsageMilli:   usage[0],
+				CPULimitMilli:   cpuLimit,
+				CPURequestMilli: cpuRequest,
+				MemUsageMB:      usage[1],
+				MemLimitMB:      memLimit,
+				MemRequestMB:    memRequest,
+				RestartCount:    totalRestarts,
+				Timestamp:       now,
+			}
+			snapshot.Pods = append(snapshot.Pods, pm)
+		}
+		return snapshot, nil
+	}
