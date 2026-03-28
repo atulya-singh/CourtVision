@@ -7,6 +7,11 @@ import (
 
 	"github.com/spf13/cobra"
 	// These would be your actual import paths:
+	"github.com/atulya-singh/CourtVision/internal/api"
+	"github.com/atulya-singh/CourtVision/internal/decision"
+	"github.com/atulya-singh/CourtVision/internal/llm"
+	"github.com/atulya-singh/CourtVision/internal/metrics"
+	"github.com/atulya-singh/CourtVision/internal/store"
 )
 
 func monitorCmd() *cobra.Command {
@@ -45,29 +50,34 @@ with SSE for real-time updates.`,
 			log.Printf("  Dry run:  %v", dryRun)
 			log.Println("---")
 
-			// st := store.New()
+			// 1. Create the shared state store
+			st := store.New()
 
-			// Choose metrics provider based on flag
+			// 2. Choose metrics provider based on flag
+			var provider metrics.Provider
 			switch metricsStr {
 			case "mock":
 				log.Println("Using mock metrics provider")
-				// provider = metrics.NewMockProvider()
+				provider = metrics.NewMockProvider()
 			case "k8s":
-				// provider = metrics.NewK8sProvider()
+				log.Println("Using Kubernetes metrics provider")
+				// provider = metrics.NewK8sProvider() ← uncomment when you build this
+				return fmt.Errorf("k8s metrics not implemented yet — use --metrics mock")
 			default:
 				return fmt.Errorf("unknown metrics source: %s (use 'mock' or 'k8s')", metricsStr)
 			}
-			// llmClient := llm.NewClient(ollamaURL, model)
-			// engine := llm.NewEngine(llmClient)
 
-			// go monitorLoop(provider, engine, st, interval)
+			// 3. Create the LLM engine
+			llmClient := llm.NewClient(ollamaURL, model)
+			engine := llm.NewEngine(llmClient)
 
-			// server := api.NewServer(st, port)
-			// return server.Start()
+			// 4. Start the monitoring loop in background
+			go monitorLoop(provider, engine, st, interval)
 
-			// PLACEHOLDER — remove this when you uncomment the real code above
-			log.Printf("Monitor would start here (port %s, interval %s)", port, interval)
-			select {} // block forever
+			// 5. Start the API server (blocks forever)
+			server := api.NewServer(st, port)
+			return server.Start()
+
 		},
 	}
 	// Register flags on this command
@@ -79,4 +89,36 @@ with SSE for real-time updates.`,
 	cmd.Flags().BoolVar(&dryRun, "dry-run", true, "Log decisions without executing them")
 
 	return cmd
+}
+
+func monitorLoop(provider metrics.Provider, engine decision.Engine, st *store.Store, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	log.Println("Monitor loop started")
+
+	for range ticker.C {
+		snapshot, err := provider.GetClusterSnapshot()
+		if err != nil {
+			log.Printf("ERROR collecting metrics: %v", err)
+			continue
+		}
+
+		st.SetSnapshot(snapshot)
+
+		decisions, err := engine.Analyze(snapshot)
+		if err != nil {
+			log.Printf("ERROR analyzing: %v", err)
+			continue
+		}
+
+		for _, d := range decisions {
+			st.AddDecision(d)
+			log.Printf("Decision: [%s] %s -> %s", d.Severity, d.TargetPod, d.Action)
+		}
+
+		if len(decisions) == 0 {
+			log.Println("Cycle complete - no issues")
+		}
+	}
 }
