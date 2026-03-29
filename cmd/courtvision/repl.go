@@ -70,15 +70,16 @@ func checkConnStatus() tea.Msg {
 // ── Model ─────────────────────────────────────────────────────────────────────
 
 type replModel struct {
-	textInput  textinput.Model
-	rootCmd    *cobra.Command
-	history    []string
-	histIdx    int
-	outputLog  []string // accumulated command outputs
-	status     connStatus
-	width      int
-	height     int
-	quitting   bool
+	textInput    textinput.Model
+	rootCmd      *cobra.Command
+	history      []string
+	histIdx      int
+	outputLog    []string // accumulated command outputs
+	status       connStatus
+	width        int
+	height       int
+	scrollOffset int // 0 = pinned to bottom, positive = scrolled up N lines
+	quitting     bool
 }
 
 func newREPL(rootCmd *cobra.Command) replModel {
@@ -119,11 +120,36 @@ func (m replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.status = connStatus(msg)
 		return m, nil
 
+	case tea.MouseMsg:
+		if msg.Button == tea.MouseButtonWheelUp {
+			m.scrollUp(3)
+			return m, nil
+		} else if msg.Button == tea.MouseButtonWheelDown {
+			m.scrollDown(3)
+			return m, nil
+		}
+
 	case tea.KeyMsg:
 		switch msg.Type {
 		case tea.KeyCtrlC:
 			m.quitting = true
 			return m, tea.Quit
+
+		case tea.KeyPgUp:
+			m.scrollUp(10)
+			return m, nil
+
+		case tea.KeyPgDown:
+			m.scrollDown(10)
+			return m, nil
+
+		case tea.KeyShiftUp:
+			m.scrollUp(1)
+			return m, nil
+
+		case tea.KeyShiftDown:
+			m.scrollDown(1)
+			return m, nil
 
 		case tea.KeyUp:
 			if len(m.history) > 0 {
@@ -164,6 +190,9 @@ func (m replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.history = append(m.history, input)
 			}
 
+			// Reset scroll to bottom on new command
+			m.scrollOffset = 0
+
 			// Styled echo of what was typed
 			echoLine := lipgloss.NewStyle().Foreground(ui.Cyan).Render("› ") +
 				lipgloss.NewStyle().Foreground(ui.White).Render(input)
@@ -199,6 +228,18 @@ func (m replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	m.textInput, cmd = m.textInput.Update(msg)
 	return m, cmd
+}
+
+func (m *replModel) scrollUp(n int) {
+	m.scrollOffset += n
+	// Clamp in View() where we know total lines
+}
+
+func (m *replModel) scrollDown(n int) {
+	m.scrollOffset -= n
+	if m.scrollOffset < 0 {
+		m.scrollOffset = 0
+	}
 }
 
 func (m replModel) View() string {
@@ -253,12 +294,34 @@ func (m replModel) View() string {
 	if len(m.outputLog) > 0 {
 		allOutput := strings.Join(m.outputLog, "\n")
 		outputLines := strings.Split(allOutput, "\n")
+		totalLines := len(outputLines)
 
-		// Scroll: only show the last N lines that fit
-		if len(outputLines) > availableLines {
-			outputLines = outputLines[len(outputLines)-availableLines:]
+		// Clamp scroll offset
+		maxScroll := totalLines - availableLines
+		if maxScroll < 0 {
+			maxScroll = 0
 		}
-		sections = append(sections, strings.Join(outputLines, "\n"))
+		if m.scrollOffset > maxScroll {
+			m.scrollOffset = maxScroll
+		}
+
+		// Window into the output based on scroll position
+		end := totalLines - m.scrollOffset
+		start := end - availableLines
+		if start < 0 {
+			start = 0
+		}
+		visible := outputLines[start:end]
+
+		outputSection := strings.Join(visible, "\n")
+
+		// Show scroll indicator if not at bottom
+		if m.scrollOffset > 0 {
+			indicator := ui.DimStyle.Render(fmt.Sprintf(" ↓ %d more lines (Shift+↓ / PgDn to scroll down)", m.scrollOffset))
+			outputSection += "\n" + indicator
+		}
+
+		sections = append(sections, outputSection)
 	} else {
 		hint := ui.DimStyle.Render("  Type \"help\" for commands, \"exit\" to quit")
 		sections = append(sections, hint)
@@ -380,6 +443,7 @@ func runREPL(rootCmd *cobra.Command) {
 	p := tea.NewProgram(
 		newREPL(rootCmd),
 		tea.WithAltScreen(),
+		tea.WithMouseCellMotion(),
 	)
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error running REPL: %v\n", err)
