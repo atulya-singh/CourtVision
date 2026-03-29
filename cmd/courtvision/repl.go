@@ -239,13 +239,17 @@ func (m *replModel) totalOutputLines() int {
 }
 
 func (m *replModel) availableLines() int {
-	// Calculate fixed chrome height dynamically:
-	// banner: count newlines in rendered banner
-	bannerHeight := strings.Count(ui.Banner(), "\n") + 1 // banner itself
-	bannerHeight += 2                                     // subtitle + version lines
+	// Calculate fixed chrome height dynamically
+	var bannerHeight int
+	if m.height < 30 {
+		bannerHeight = 1 // compact single-line header
+	} else {
+		bannerHeight = strings.Count(ui.Banner(), "\n") + 1 // ASCII art
+		bannerHeight += 2                                     // subtitle + version lines
+	}
 	statusBarHeight := 1
 	inputBoxHeight := 3 // top border + content + bottom border
-	separators := 3     // newlines joining sections
+	separators := 6     // double newlines joining 4 sections (3 gaps × 2)
 	fixedLines := bannerHeight + statusBarHeight + inputBoxHeight + separators
 
 	avail := m.height - fixedLines
@@ -288,9 +292,17 @@ func (m replModel) View() string {
 	var sections []string
 
 	// ── Banner area (top) ─────────────────────────────────────────────────
-	banner := ui.Banner() + "\n" +
-		ui.SubtitleStyle.Render("  Agentic Infrastructure Monitor") + "\n" +
-		ui.DimStyle.Render(fmt.Sprintf("  %s (commit: %s)", version, commit))
+	// Use compact header in small terminals (e.g. VS Code bottom panel)
+	var banner string
+	if m.height < 30 {
+		banner = ui.BrandStyle.Render("  CourtVision") + "  " +
+			ui.SubtitleStyle.Render("Agentic Infrastructure Monitor") + "  " +
+			ui.DimStyle.Render(fmt.Sprintf("%s (%s)", version, commit))
+	} else {
+		banner = ui.Banner() + "\n" +
+			ui.SubtitleStyle.Render("  Agentic Infrastructure Monitor") + "\n" +
+			ui.DimStyle.Render(fmt.Sprintf("  %s (commit: %s)", version, commit))
+	}
 	sections = append(sections, banner)
 
 	// ── Status bar with horizontal line ───────────────────────────────────
@@ -421,7 +433,7 @@ func (m replModel) View() string {
 
 	sections = append(sections, box)
 
-	return strings.Join(sections, "\n")
+	return strings.Join(sections, "\n\n")
 }
 
 // ── Help renderer ─────────────────────────────────────────────────────────────
@@ -435,7 +447,7 @@ func renderHelp() string {
 	nameStyle := lipgloss.NewStyle().
 		Foreground(ui.Cyan).
 		Bold(true).
-		Width(12)
+		Width(10)
 
 	descStyle := lipgloss.NewStyle().
 		Foreground(ui.Gray)
