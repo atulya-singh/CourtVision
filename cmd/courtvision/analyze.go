@@ -41,7 +41,11 @@ AI-powered analysis.`,
 			case "mock":
 				provider = metrics.NewMockProvider()
 			case "k8s":
-				//provider = metrics.NewK8sProvider()
+				p, err := metrics.NewK8sProvider(namespace)
+				if err != nil {
+					return fmt.Errorf("failed to connect to cluster: %w", err)
+				}
+				provider = p
 			default:
 				return fmt.Errorf("unknown metrics source: %s", metricsStr)
 			}
