@@ -249,7 +249,7 @@ func (m *replModel) availableLines() int {
 	}
 	statusBarHeight := 1
 	inputBoxHeight := 3 // top border + content + bottom border
-	separators := 6     // double newlines joining 4 sections (3 gaps × 2)
+	separators := 3     // newlines joining 4 sections (3 gaps)
 	fixedLines := bannerHeight + statusBarHeight + inputBoxHeight + separators
 
 	avail := m.height - fixedLines
@@ -433,7 +433,7 @@ func (m replModel) View() string {
 
 	sections = append(sections, box)
 
-	return strings.Join(sections, "\n\n")
+	return strings.Join(sections, "\n")
 }
 
 // ── Help renderer ─────────────────────────────────────────────────────────────
