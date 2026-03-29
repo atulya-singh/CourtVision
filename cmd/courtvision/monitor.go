@@ -3,8 +3,10 @@ package main
 import (
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
+	"github.com/atulya-singh/CourtVision/internal/ui"
 	"github.com/spf13/cobra"
 	// These would be your actual import paths:
 	"github.com/atulya-singh/CourtVision/internal/api"
@@ -15,8 +17,6 @@ import (
 )
 
 func monitorCmd() *cobra.Command {
-	// define flag variables - these get filled in when cobra parses the command line
-
 	var (
 		port       string
 		ollamaURL  string
@@ -33,23 +33,47 @@ func monitorCmd() *cobra.Command {
 		Long: `Start the CourtVision monitoring agent. It continuously collects
 cluster metrics, analyzes them with a local LLM, and serves a
 real-time dashboard.
- 
+
 The agent runs a monitoring loop at the specified interval,
 collecting metrics from the configured source and sending them
 to the LLM for analysis. Decisions are served via an HTTP API
 with SSE for real-time updates.`,
 
 		RunE: func(cmd *cobra.Command, args []string) error {
-			log.SetFlags(log.Ltime | log.Lmsgprefix)
-			log.SetPrefix("[CourtVision] ")
+			// Print banner
+			fmt.Println(ui.Banner())
+			fmt.Println()
 
-			log.Println("Starting Agentic Infrastructure Monitor")
-			log.Printf("  Metrics:  %s", metricsStr)
-			log.Printf("  Ollama:   %s (model: %s)", ollamaURL, model)
-			log.Printf("  API port: %s", port)
-			log.Printf("  Interval: %s", interval)
-			log.Printf("  Dry run:  %v", dryRun)
-			log.Println("---")
+			// Build config box
+			var configLines []string
+			configLines = append(configLines, ui.BrandStyle.Render("Configuration"))
+			configLines = append(configLines, "")
+			configLines = append(configLines, ui.ConfigLine("Metrics:", metricsStr))
+			configLines = append(configLines, ui.ConfigLine("Ollama:", fmt.Sprintf("%s (model: %s)", ollamaURL, ui.CyanStyle.Render(model))))
+			configLines = append(configLines, ui.ConfigLine("API port:", port))
+			configLines = append(configLines, ui.ConfigLine("Interval:", interval.String()))
+
+			if dryRun {
+				configLines = append(configLines, ui.ConfigLine("Mode:", ui.DryRunBadge))
+			} else {
+				configLines = append(configLines, ui.ConfigLine("Mode:", ui.GreenStyle.Render("LIVE")))
+			}
+
+			fmt.Println(ui.ConfigBox.Render(strings.Join(configLines, "\n")))
+			fmt.Println()
+
+			// Set up styled logging
+			log.SetFlags(0)
+			log.SetPrefix("")
+
+			styledLog := func(format string, args ...interface{}) {
+				ts := ui.DimStyle.Render(time.Now().Format("15:04:05"))
+				msg := fmt.Sprintf(format, args...)
+				fmt.Printf("  %s  %s\n", ts, msg)
+			}
+
+			styledLog("Starting Agentic Infrastructure Monitor")
+			styledLog("%s", ui.DimStyle.Render("───────────────────────────────────────"))
 
 			// 1. Create the shared state store
 			st := store.New()
@@ -58,10 +82,10 @@ with SSE for real-time updates.`,
 			var provider metrics.Provider
 			switch metricsStr {
 			case "mock":
-				log.Println("Using mock metrics provider")
+				styledLog("Using %s metrics provider", ui.CyanStyle.Render("mock"))
 				provider = metrics.NewMockProvider()
 			case "k8s":
-				log.Println("Using Kubernetes metrics provider")
+				styledLog("Using %s metrics provider", ui.CyanStyle.Render("Kubernetes"))
 				var err error
 				provider, err = metrics.NewK8sProvider(namespace)
 				if err != nil {
@@ -76,15 +100,15 @@ with SSE for real-time updates.`,
 			engine := llm.NewEngine(llmClient)
 
 			// 4. Start the monitoring loop in background
-			go monitorLoop(provider, engine, st, interval)
+			go styledMonitorLoop(provider, engine, st, interval)
 
 			// 5. Start the API server (blocks forever)
 			server := api.NewServer(st, port)
+			styledLog("API server listening on %s", ui.CyanStyle.Render(":"+port))
 			return server.Start()
-
 		},
 	}
-	// Register flags on this command
+
 	cmd.Flags().StringVar(&port, "port", "8080", "API server port")
 	cmd.Flags().StringVar(&ollamaURL, "ollama-url", "http://localhost:11434", "Ollama server URL")
 	cmd.Flags().StringVar(&model, "model", "llama3", "LLM model name")
@@ -96,16 +120,22 @@ with SSE for real-time updates.`,
 	return cmd
 }
 
-func monitorLoop(provider metrics.Provider, engine decision.Engine, st *store.Store, interval time.Duration) {
+func styledMonitorLoop(provider metrics.Provider, engine decision.Engine, st *store.Store, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	log.Println("Monitor loop started")
+	styledLog := func(format string, args ...interface{}) {
+		ts := ui.DimStyle.Render(time.Now().Format("15:04:05"))
+		msg := fmt.Sprintf(format, args...)
+		fmt.Printf("  %s  %s\n", ts, msg)
+	}
+
+	styledLog("Monitor loop started")
 
 	for range ticker.C {
 		snapshot, err := provider.GetClusterSnapshot()
 		if err != nil {
-			log.Printf("ERROR collecting metrics: %v", err)
+			styledLog("%s collecting metrics: %v", ui.RedStyle.Render("ERROR"), err)
 			continue
 		}
 
@@ -113,17 +143,20 @@ func monitorLoop(provider metrics.Provider, engine decision.Engine, st *store.St
 
 		decisions, err := engine.Analyze(snapshot)
 		if err != nil {
-			log.Printf("ERROR analyzing: %v", err)
+			styledLog("%s analyzing: %v", ui.RedStyle.Render("ERROR"), err)
 			continue
 		}
 
 		for _, d := range decisions {
 			st.AddDecision(d)
-			log.Printf("Decision: [%s] %s -> %s", d.Severity, d.TargetPod, d.Action)
+			styledLog("Decision: %s %s → %s",
+				ui.SeverityBadge(string(d.Severity)),
+				ui.CyanStyle.Render(d.TargetPod),
+				ui.BlueStyle.Render(string(d.Action)))
 		}
 
 		if len(decisions) == 0 {
-			log.Println("Cycle complete - no issues")
+			styledLog("%s Cycle complete — no issues", ui.CheckMark)
 		}
 	}
 }
