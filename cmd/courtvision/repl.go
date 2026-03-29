@@ -230,9 +230,47 @@ func (m replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+func (m *replModel) totalOutputLines() int {
+	if len(m.outputLog) == 0 {
+		return 0
+	}
+	allOutput := strings.Join(m.outputLog, "\n")
+	return len(strings.Split(allOutput, "\n"))
+}
+
+func (m *replModel) availableLines() int {
+	// Calculate fixed chrome height dynamically:
+	// banner: count newlines in rendered banner
+	bannerHeight := strings.Count(ui.Banner(), "\n") + 1 // banner itself
+	bannerHeight += 2                                     // subtitle + version lines
+	statusBarHeight := 1
+	inputBoxHeight := 3 // top border + content + bottom border
+	separators := 3     // newlines joining sections
+	fixedLines := bannerHeight + statusBarHeight + inputBoxHeight + separators
+
+	avail := m.height - fixedLines
+	if avail < 3 {
+		avail = 3
+	}
+	return avail
+}
+
+func (m *replModel) maxScroll() int {
+	total := m.totalOutputLines()
+	avail := m.availableLines()
+	// Reserve 2 lines for scroll indicators (up + down) when scrolled
+	max := total - avail + 2
+	if max < 0 {
+		max = 0
+	}
+	return max
+}
+
 func (m *replModel) scrollUp(n int) {
 	m.scrollOffset += n
-	// Clamp in View() where we know total lines
+	if max := m.maxScroll(); m.scrollOffset > max {
+		m.scrollOffset = max
+	}
 }
 
 func (m *replModel) scrollDown(n int) {
@@ -283,31 +321,53 @@ func (m replModel) View() string {
 	sections = append(sections, statusBar)
 
 	// ── Output area (scrollable) ──────────────────────────────────────────
-	// Calculate how many lines we have for output
-	// Total layout: banner(~14) + blank + statusbar(1) + blank + inputbox(3) + blank = ~20 fixed
-	fixedLines := 20
-	availableLines := m.height - fixedLines
-	if availableLines < 3 {
-		availableLines = 3
-	}
+	availableLines := m.availableLines()
 
 	if len(m.outputLog) > 0 {
 		allOutput := strings.Join(m.outputLog, "\n")
 		outputLines := strings.Split(allOutput, "\n")
 		totalLines := len(outputLines)
 
-		// Clamp scroll offset
-		maxScroll := totalLines - availableLines
-		if maxScroll < 0 {
-			maxScroll = 0
+		// Calculate visible window, reserving lines for scroll indicators
+		displayLines := availableLines
+
+		// We need two passes: first estimate if indicators are needed,
+		// then adjust display lines accordingly
+		end := totalLines - m.scrollOffset
+		if end > totalLines {
+			end = totalLines
 		}
-		if m.scrollOffset > maxScroll {
-			m.scrollOffset = maxScroll
+		if end < 0 {
+			end = 0
+		}
+		start := end - displayLines
+		if start < 0 {
+			start = 0
 		}
 
-		// Window into the output based on scroll position
-		end := totalLines - m.scrollOffset
-		start := end - availableLines
+		// Reserve lines for indicators that will be shown
+		needsDownIndicator := m.scrollOffset > 0
+		needsUpIndicator := start > 0
+
+		if needsDownIndicator {
+			displayLines--
+		}
+		if needsUpIndicator {
+			displayLines--
+		}
+		if displayLines < 1 {
+			displayLines = 1
+		}
+
+		// Recalculate window with adjusted display lines
+		end = totalLines - m.scrollOffset
+		if end > totalLines {
+			end = totalLines
+		}
+		if end < 0 {
+			end = 0
+		}
+		start = end - displayLines
 		if start < 0 {
 			start = 0
 		}
@@ -315,9 +375,13 @@ func (m replModel) View() string {
 
 		outputSection := strings.Join(visible, "\n")
 
-		// Show scroll indicator if not at bottom
+		// Show scroll indicators
+		if start > 0 {
+			upIndicator := ui.DimStyle.Render(fmt.Sprintf(" ↑ %d more lines above (Shift+↑ / PgUp)", start))
+			outputSection = upIndicator + "\n" + outputSection
+		}
 		if m.scrollOffset > 0 {
-			indicator := ui.DimStyle.Render(fmt.Sprintf(" ↓ %d more lines (Shift+↓ / PgDn to scroll down)", m.scrollOffset))
+			indicator := ui.DimStyle.Render(fmt.Sprintf(" ↓ %d more lines below (Shift+↓ / PgDn)", m.scrollOffset))
 			outputSection += "\n" + indicator
 		}
 
