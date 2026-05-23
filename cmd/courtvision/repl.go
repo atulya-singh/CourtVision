@@ -70,16 +70,14 @@ func checkConnStatus() tea.Msg {
 // ── Model ─────────────────────────────────────────────────────────────────────
 
 type replModel struct {
-	textInput    textinput.Model
-	rootCmd      *cobra.Command
-	history      []string
-	histIdx      int
-	outputLog    []string // accumulated command outputs
-	status       connStatus
-	width        int
-	height       int
-	scrollOffset int // 0 = pinned to bottom, positive = scrolled up N lines
-	quitting     bool
+	textInput textinput.Model
+	rootCmd   *cobra.Command
+	history   []string
+	histIdx   int
+	output    []string // lines of output from commands
+	status    connStatus
+	width     int
+	quitting  bool
 }
 
 func newREPL(rootCmd *cobra.Command) replModel {
@@ -95,7 +93,6 @@ func newREPL(rootCmd *cobra.Command) replModel {
 		history:   []string{},
 		histIdx:   -1,
 		width:     80,
-		height:    24,
 	}
 }
 
@@ -108,7 +105,6 @@ func (m replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
-		m.height = msg.Height
 		boxInner := m.width - 4 // border + padding
 		if boxInner < 20 {
 			boxInner = 20
@@ -120,36 +116,11 @@ func (m replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.status = connStatus(msg)
 		return m, nil
 
-	case tea.MouseMsg:
-		if msg.Button == tea.MouseButtonWheelUp {
-			m.scrollUp(3)
-			return m, nil
-		} else if msg.Button == tea.MouseButtonWheelDown {
-			m.scrollDown(3)
-			return m, nil
-		}
-
 	case tea.KeyMsg:
 		switch msg.Type {
 		case tea.KeyCtrlC:
 			m.quitting = true
 			return m, tea.Quit
-
-		case tea.KeyPgUp:
-			m.scrollUp(10)
-			return m, nil
-
-		case tea.KeyPgDown:
-			m.scrollDown(10)
-			return m, nil
-
-		case tea.KeyShiftUp:
-			m.scrollUp(1)
-			return m, nil
-
-		case tea.KeyShiftDown:
-			m.scrollDown(1)
-			return m, nil
 
 		case tea.KeyUp:
 			if len(m.history) > 0 {
@@ -190,13 +161,10 @@ func (m replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.history = append(m.history, input)
 			}
 
-			// Reset scroll to bottom on new command
-			m.scrollOffset = 0
-
 			// Styled echo of what was typed
 			echoLine := lipgloss.NewStyle().Foreground(ui.Cyan).Render("› ") +
 				lipgloss.NewStyle().Foreground(ui.White).Render(input)
-			m.outputLog = append(m.outputLog, echoLine)
+			m.output = append(m.output, echoLine)
 
 			// Handle exit/quit
 			if input == "exit" || input == "quit" {
@@ -206,20 +174,20 @@ func (m replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			// Handle help
 			if input == "help" {
-				m.outputLog = append(m.outputLog, renderHelp())
+				m.output = append(m.output, renderHelp())
 				return m, nil
 			}
 
 			// Handle clear
 			if input == "clear" {
-				m.outputLog = nil
+				m.output = nil
 				return m, nil
 			}
 
 			// Execute subcommand and refresh status
 			result := executeCommand(m.rootCmd, input)
 			if result != "" {
-				m.outputLog = append(m.outputLog, result)
+				m.output = append(m.output, result)
 			}
 			return m, checkConnStatus
 		}
@@ -230,180 +198,20 @@ func (m replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-func (m *replModel) totalOutputLines() int {
-	if len(m.outputLog) == 0 {
-		return 0
-	}
-	allOutput := strings.Join(m.outputLog, "\n")
-	return len(strings.Split(allOutput, "\n"))
-}
-
-func (m *replModel) availableLines() int {
-	// Calculate fixed chrome height dynamically
-	var bannerHeight int
-	if m.height < 30 {
-		bannerHeight = 1 // compact single-line header
-	} else {
-		bannerHeight = strings.Count(ui.Banner(), "\n") + 1 // ASCII art
-		bannerHeight += 2                                     // subtitle + version lines
-	}
-	statusBarHeight := 1
-	inputBoxHeight := 3 // top border + content + bottom border
-	separators := 3     // newlines joining 4 sections (3 gaps)
-	fixedLines := bannerHeight + statusBarHeight + inputBoxHeight + separators
-
-	avail := m.height - fixedLines
-	if avail < 3 {
-		avail = 3
-	}
-	return avail
-}
-
-func (m *replModel) maxScroll() int {
-	total := m.totalOutputLines()
-	avail := m.availableLines()
-	// Reserve 2 lines for scroll indicators (up + down) when scrolled
-	max := total - avail + 2
-	if max < 0 {
-		max = 0
-	}
-	return max
-}
-
-func (m *replModel) scrollUp(n int) {
-	m.scrollOffset += n
-	if max := m.maxScroll(); m.scrollOffset > max {
-		m.scrollOffset = max
-	}
-}
-
-func (m *replModel) scrollDown(n int) {
-	m.scrollOffset -= n
-	if m.scrollOffset < 0 {
-		m.scrollOffset = 0
-	}
-}
-
 func (m replModel) View() string {
 	if m.quitting {
 		return goodbyeStyle.Render("  Goodbye!") + "\n"
 	}
 
-	var sections []string
+	var b strings.Builder
 
-	// ── Banner area (top) ─────────────────────────────────────────────────
-	// Use compact header in small terminals (e.g. VS Code bottom panel)
-	var banner string
-	if m.height < 30 {
-		banner = ui.BrandStyle.Render("  CourtVision") + "  " +
-			ui.SubtitleStyle.Render("Agentic Infrastructure Monitor") + "  " +
-			ui.DimStyle.Render(fmt.Sprintf("%s (%s)", version, commit))
-	} else {
-		banner = ui.Banner() + "\n" +
-			ui.SubtitleStyle.Render("  Agentic Infrastructure Monitor") + "\n" +
-			ui.DimStyle.Render(fmt.Sprintf("  %s (commit: %s)", version, commit))
-	}
-	sections = append(sections, banner)
-
-	// ── Status bar with horizontal line ───────────────────────────────────
-	ollamaDot := statusDotRed
-	ollamaLabel := "disconnected"
-	if m.status.ollamaOK {
-		ollamaDot = statusDotGreen
-		ollamaLabel = "connected"
+	// ── Output (prints inline, scrolls naturally) ─────────────────────────
+	if len(m.output) > 0 {
+		b.WriteString(strings.Join(m.output, "\n"))
+		b.WriteString("\n")
 	}
 
-	k8sDot := statusDotRed
-	k8sLabel := "disconnected"
-	if m.status.k8sOK {
-		k8sDot = statusDotGreen
-		k8sLabel = "connected"
-	}
-
-	statusText := fmt.Sprintf(" %s Ollama %s   %s Kubernetes %s ",
-		ollamaDot, statusBarStyle.Render(ollamaLabel),
-		k8sDot, statusBarStyle.Render(k8sLabel))
-
-	lineWidth := m.width - lipgloss.Width(statusText) - 2
-	if lineWidth < 0 {
-		lineWidth = 0
-	}
-	line := lipgloss.NewStyle().Foreground(ui.DimGray).Render(strings.Repeat("─", lineWidth))
-	statusBar := statusText + line
-	sections = append(sections, statusBar)
-
-	// ── Output area (scrollable) ──────────────────────────────────────────
-	availableLines := m.availableLines()
-
-	if len(m.outputLog) > 0 {
-		allOutput := strings.Join(m.outputLog, "\n")
-		outputLines := strings.Split(allOutput, "\n")
-		totalLines := len(outputLines)
-
-		// Calculate visible window, reserving lines for scroll indicators
-		displayLines := availableLines
-
-		// We need two passes: first estimate if indicators are needed,
-		// then adjust display lines accordingly
-		end := totalLines - m.scrollOffset
-		if end > totalLines {
-			end = totalLines
-		}
-		if end < 0 {
-			end = 0
-		}
-		start := end - displayLines
-		if start < 0 {
-			start = 0
-		}
-
-		// Reserve lines for indicators that will be shown
-		needsDownIndicator := m.scrollOffset > 0
-		needsUpIndicator := start > 0
-
-		if needsDownIndicator {
-			displayLines--
-		}
-		if needsUpIndicator {
-			displayLines--
-		}
-		if displayLines < 1 {
-			displayLines = 1
-		}
-
-		// Recalculate window with adjusted display lines
-		end = totalLines - m.scrollOffset
-		if end > totalLines {
-			end = totalLines
-		}
-		if end < 0 {
-			end = 0
-		}
-		start = end - displayLines
-		if start < 0 {
-			start = 0
-		}
-		visible := outputLines[start:end]
-
-		outputSection := strings.Join(visible, "\n")
-
-		// Show scroll indicators
-		if start > 0 {
-			upIndicator := ui.DimStyle.Render(fmt.Sprintf(" ↑ %d more lines above (Shift+↑ / PgUp)", start))
-			outputSection = upIndicator + "\n" + outputSection
-		}
-		if m.scrollOffset > 0 {
-			indicator := ui.DimStyle.Render(fmt.Sprintf(" ↓ %d more lines below (Shift+↓ / PgDn)", m.scrollOffset))
-			outputSection += "\n" + indicator
-		}
-
-		sections = append(sections, outputSection)
-	} else {
-		hint := ui.DimStyle.Render("  Type \"help\" for commands, \"exit\" to quit")
-		sections = append(sections, hint)
-	}
-
-	// ── Input box (pinned at bottom) ──────────────────────────────────────
+	// ── Input box (always at the bottom) ──────────────────────────────────
 	boxWidth := m.width - 2
 	if boxWidth < 30 {
 		boxWidth = 30
@@ -421,19 +229,17 @@ func (m replModel) View() string {
 	if len(boxLines) > 0 {
 		topBorder := boxLines[0]
 		runes := []rune(topBorder)
-		// Place label after the first 2 characters of the border
 		labelRendered := label
 		labelWidth := lipgloss.Width(labelRendered)
 		if len(runes) > labelWidth+4 {
-			// Insert label into the top border
 			boxLines[0] = string(runes[:2]) + labelRendered + string(runes[2+labelWidth:])
 		}
 		box = strings.Join(boxLines, "\n")
 	}
 
-	sections = append(sections, box)
+	b.WriteString(box)
 
-	return strings.Join(sections, "\n")
+	return b.String()
 }
 
 // ── Help renderer ─────────────────────────────────────────────────────────────
@@ -513,13 +319,46 @@ func executeCommand(rootCmd *cobra.Command, input string) string {
 	return strings.TrimRight(output, "\n")
 }
 
+// ── Startup banner (printed once before TUI) ─────────────────────────────────
+
+func printStartupBanner() {
+	fmt.Println(ui.Banner())
+	fmt.Println(ui.SubtitleStyle.Render("  Agentic Infrastructure Monitor"))
+	fmt.Println(ui.DimStyle.Render(fmt.Sprintf("  %s (commit: %s)", version, commit)))
+	fmt.Println()
+
+	// Quick connectivity check
+	s := checkConnStatus().(statusMsg)
+
+	ollamaDot := statusDotRed
+	ollamaLabel := "disconnected"
+	if s.ollamaOK {
+		ollamaDot = statusDotGreen
+		ollamaLabel = "connected"
+	}
+
+	k8sDot := statusDotRed
+	k8sLabel := "disconnected"
+	if s.k8sOK {
+		k8sDot = statusDotGreen
+		k8sLabel = "connected"
+	}
+
+	fmt.Printf(" %s Ollama %s   %s Kubernetes %s\n",
+		ollamaDot, statusBarStyle.Render(ollamaLabel),
+		k8sDot, statusBarStyle.Render(k8sLabel))
+	fmt.Println()
+	fmt.Println(ui.DimStyle.Render("  Type \"help\" for commands, \"exit\" to quit"))
+	fmt.Println()
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 func runREPL(rootCmd *cobra.Command) {
+	printStartupBanner()
+
 	p := tea.NewProgram(
 		newREPL(rootCmd),
-		tea.WithAltScreen(),
-		tea.WithMouseCellMotion(),
 	)
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error running REPL: %v\n", err)
