@@ -121,7 +121,7 @@ func (k *K8sProvider) GetClusterSnapshot() (*types.ClusterSnapshot, error) {
 		usage := nodeUsageMap[node.Name]
 
 		nodeType := "general"
-		if instanceType, ok := node.Labels["node.kubernetes.io/instance-typ"]; ok {
+		if instanceType, ok := node.Labels["node.kubernetes.io/instance-type"]; ok {
 			nodeType = instanceType
 		}
 

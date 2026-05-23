@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"strings"
@@ -308,11 +309,10 @@ func executeCommand(rootCmd *cobra.Command, input string) string {
 	w.Close()
 	os.Stdout = old
 
-	var buf [64 * 1024]byte
-	n, _ := r.Read(buf[:])
+	outputBytes, _ := io.ReadAll(r)
 	r.Close()
 
-	output := string(buf[:n])
+	output := string(outputBytes)
 	if execErr != nil {
 		return errorStyle.Render(fmt.Sprintf("  Error: %v", execErr))
 	}

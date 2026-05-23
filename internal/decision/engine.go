@@ -8,7 +8,7 @@ import (
 )
 
 type Engine interface {
-	Analyze(spapshot *types.ClusterSnapshot) ([]types.Decision, error)
+	Analyze(snapshot *types.ClusterSnapshot) ([]types.Decision, error)
 }
 
 type RuleBasedEngine struct {
@@ -21,7 +21,7 @@ func NewRuleBasedEngine() *RuleBasedEngine {
 
 func (r *RuleBasedEngine) nextID() string {
 	r.decisionCount++
-	return fmt.Sprintf("decision -%d-%d", time.Now().Unix(), r.decisionCount)
+	return fmt.Sprintf("decision-%d-%d", time.Now().Unix(), r.decisionCount)
 }
 
 func (r *RuleBasedEngine) Analyze(snapshot *types.ClusterSnapshot) ([]types.Decision, error) {
@@ -39,6 +39,9 @@ func (r *RuleBasedEngine) Analyze(snapshot *types.ClusterSnapshot) ([]types.Deci
 
 		if cpuPct > 90 {
 			node := nodeMap[pod.NodeName]
+			if node == nil {
+				continue
+			}
 			severity := types.SeverityMedium
 
 			if cpuPct > 130 {
