@@ -30,7 +30,7 @@ func (r *RuleBasedEngine) Analyze(snapshot *types.ClusterSnapshot) ([]types.Deci
 	//A map of node pressure
 	nodeMap := make(map[string]*types.NodeMetrics)
 	for i := range snapshot.Nodes {
-		nodeMap[snapshot.Nodes[i].NodeName] = &snapshot.Nodes[1]
+		nodeMap[snapshot.Nodes[i].NodeName] = &snapshot.Nodes[i]
 	}
 
 	for _, pod := range snapshot.Pods {
