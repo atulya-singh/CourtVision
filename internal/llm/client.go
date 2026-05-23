@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"time"
 )
@@ -47,49 +48,62 @@ type ollamaResponse struct {
 	Done     bool   `json:"done"`
 }
 
-// Generate sends a prompt to Ollama and returns the raw text response (no parsing yet)
+// Generate sends a prompt to Ollama and returns the raw text response.
+// It retries up to 3 times on transient network errors with exponential
+// backoff and jitter. Non-2xx Ollama responses are not retried.
 func (c *Client) Generate(prompt string) (string, error) {
-	// 1. Build the request body
 	reqBody := ollamaRequest{
 		Model:  c.model,
 		Prompt: prompt,
-		Stream: false, // This is for getting complete response, not a token by token response
+		Stream: false,
 		Options: ollamaOptions{
-			Temperature: 0.1,  // low temp = more consisten answers
-			NumPredict:  2048, // enough room for analysis + JSON
+			Temperature: 0.1,
+			NumPredict:  2048,
 		},
 	}
 
-	// 2. Serialize to JSON
-
 	jsonData, err := json.Marshal(reqBody)
 	if err != nil {
-		return "", fmt.Errorf("falied to marshal request: %w", err)
+		return "", fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	// 3. Make the HTTP POST request
-	url := c.baseURL + "/api/generate"
-	resp, err := c.httpClient.Post(url, "application/json", bytes.NewReader(jsonData))
-	if err != nil {
-		return "", fmt.Errorf("ollama request failed: %w", err)
-	}
-	defer resp.Body.Close()
+	const maxAttempts = 3
+	var lastErr error
 
-	// 4. Read the response body
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("failed to read response: %w", err)
+	for i := 0; i < maxAttempts; i++ {
+		if i > 0 {
+			// Exponential backoff: 100ms, 200ms — plus ±20% jitter to avoid
+			// thundering herd if multiple agents restart simultaneously.
+			base := time.Duration(100*(1<<uint(i-1))) * time.Millisecond
+			jitter := time.Duration(rand.Int63n(int64(base) / 5))
+			time.Sleep(base + jitter)
+		}
+
+		resp, err := c.httpClient.Post(c.baseURL+"/api/generate", "application/json", bytes.NewReader(jsonData))
+		if err != nil {
+			lastErr = fmt.Errorf("connection failed: %w", err)
+			continue
+		}
+
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			lastErr = fmt.Errorf("failed to read response: %w", err)
+			continue
+		}
+
+		// Non-2xx responses are Ollama application errors (bad model name,
+		// malformed request) — they won't recover on retry.
+		if resp.StatusCode != http.StatusOK {
+			return "", fmt.Errorf("ollama returned status %d: %s", resp.StatusCode, string(body))
+		}
+
+		var ollamaResp ollamaResponse
+		if err := json.Unmarshal(body, &ollamaResp); err != nil {
+			return "", fmt.Errorf("failed to parse response: %w", err)
+		}
+		return ollamaResp.Response, nil
 	}
 
-	// 5. Check HTTP status
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("ollama returned status %d: %s", resp.StatusCode, string(body))
-	}
-
-	// 6. Parse the JSON response
-	var ollamaResp ollamaResponse
-	if err := json.Unmarshal(body, &ollamaResp); err != nil {
-		return "", fmt.Errorf("failed to parse response: %w", err)
-	}
-	return ollamaResp.Response, nil
+	return "", fmt.Errorf("ollama unreachable after %d attempts: %w", maxAttempts, lastErr)
 }

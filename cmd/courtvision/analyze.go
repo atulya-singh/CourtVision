@@ -7,12 +7,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/atulya-singh/CourtVision/internal/decision"
 	"github.com/atulya-singh/CourtVision/internal/llm"
 	"github.com/atulya-singh/CourtVision/internal/metrics"
 	"github.com/atulya-singh/CourtVision/internal/types"
 	"github.com/atulya-singh/CourtVision/internal/ui"
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/spf13/cobra"
 )
 
@@ -27,7 +29,7 @@ type analysisResult struct {
 type analyzeModel struct {
 	spinner  spinner.Model
 	provider metrics.Provider
-	engine   *llm.Engine
+	engine   decision.Engine
 	output   string
 	result   *analysisResult
 	quitting bool
@@ -121,9 +123,11 @@ AI-powered analysis.`,
 				return fmt.Errorf("unknown metrics source: %s", metricsStr)
 			}
 
-			// 2. Create LLM engine
-			llmClient := llm.NewClient(ollamaURL, model)
-			engine := llm.NewEngine(llmClient)
+			// 2. Create LLM engine with rule-based fallback
+			engine := decision.NewFallbackEngine(
+				llm.NewEngine(llm.NewClient(ollamaURL, model)),
+				decision.NewRuleBasedEngine(),
+			)
 
 			// 3. Run with spinner
 			s := spinner.New()
@@ -185,17 +189,18 @@ func printJSON(decisions []types.Decision) error {
 func printStyledTable(decisions []types.Decision, source string, elapsed time.Duration) error {
 	fmt.Println()
 
-	// Header
-	header := fmt.Sprintf("  %-14s %-27s %-17s %s",
-		ui.BoldStyle.Render("SEVERITY"),
-		ui.BoldStyle.Render("POD"),
-		ui.BoldStyle.Render("ACTION"),
+	// Header — use lipgloss Width() so ANSI codes don't break column math
+	col := func(w int, s string) string { return lipgloss.NewStyle().Width(w).Render(s) }
+	header := fmt.Sprintf("  %s %s %s %s",
+		col(14, ui.BoldStyle.Render("SEVERITY")),
+		col(27, ui.BoldStyle.Render("POD")),
+		col(17, ui.BoldStyle.Render("ACTION")),
 		ui.BoldStyle.Render("REASONING"))
 	fmt.Println(header)
 	fmt.Printf("  %s %s %s %s\n",
-		ui.DimStyle.Render(strings.Repeat("─", 12)),
-		ui.DimStyle.Render(strings.Repeat("─", 25)),
-		ui.DimStyle.Render(strings.Repeat("─", 15)),
+		ui.DimStyle.Render(strings.Repeat("─", 14)),
+		ui.DimStyle.Render(strings.Repeat("─", 27)),
+		ui.DimStyle.Render(strings.Repeat("─", 17)),
 		ui.DimStyle.Render(strings.Repeat("─", 50)),
 	)
 
@@ -204,10 +209,10 @@ func printStyledTable(decisions []types.Decision, source string, elapsed time.Du
 		if len(reasoning) > 50 {
 			reasoning = reasoning[:47] + "..."
 		}
-		fmt.Printf("  %-14s %-27s %-17s %s\n",
-			ui.SeverityBadge(string(d.Severity)),
-			ui.CyanStyle.Render(d.TargetPod),
-			ui.BlueStyle.Render(string(d.Action)),
+		fmt.Printf("  %s %s %s %s\n",
+			col(14, ui.SeverityBadge(string(d.Severity))),
+			ui.CyanStyle.Width(27).Render(d.TargetPod),
+			ui.BlueStyle.Width(17).Render(string(d.Action)),
 			reasoning)
 	}
 

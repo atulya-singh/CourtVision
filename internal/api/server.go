@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -22,26 +23,39 @@ func NewServer(st *store.Store, port string) *Server {
 	return &Server{store: st, port: port}
 }
 
-// Start registers all routes and begins listening
-func (s *Server) Start() error {
+// Start registers all routes and begins listening. It returns when ctx is
+// cancelled, giving in-flight requests up to 5 seconds to complete.
+func (s *Server) Start(ctx context.Context) error {
 	mux := http.NewServeMux()
 
-	//API routes
 	mux.HandleFunc("/api/cluster", s.handleCluster)
 	mux.HandleFunc("/api/decisions", s.handleDecisions)
 	mux.HandleFunc("/api/events", s.handleSSE)
-
 	mux.HandleFunc("/api/decisions/", s.handleDecisionAction)
-
-	// Health check
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"status":"ok"}`))
 	})
 
-	handler := corsMiddleware(mux)
+	srv := &http.Server{
+		Addr:    ":" + s.port,
+		Handler: corsMiddleware(mux),
+	}
+
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("server shutdown error: %v", err)
+		}
+	}()
+
 	log.Printf("API server starting on :%s", s.port)
-	return http.ListenAndServe(":"+s.port, handler)
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		return err
+	}
+	return nil
 }
 
 func (s *Server) handleCluster(w http.ResponseWriter, r *http.Request) {

@@ -1,19 +1,22 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
+	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
-	"github.com/atulya-singh/CourtVision/internal/ui"
-	"github.com/spf13/cobra"
-	// These would be your actual import paths:
 	"github.com/atulya-singh/CourtVision/internal/api"
 	"github.com/atulya-singh/CourtVision/internal/decision"
 	"github.com/atulya-singh/CourtVision/internal/llm"
 	"github.com/atulya-singh/CourtVision/internal/metrics"
 	"github.com/atulya-singh/CourtVision/internal/store"
+	"github.com/atulya-singh/CourtVision/internal/ui"
+	"github.com/spf13/cobra"
 )
 
 func monitorCmd() *cobra.Command {
@@ -40,6 +43,9 @@ to the LLM for analysis. Decisions are served via an HTTP API
 with SSE for real-time updates.`,
 
 		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+			defer stop()
+
 			// Print banner
 			fmt.Println(ui.Banner())
 			fmt.Println()
@@ -95,17 +101,20 @@ with SSE for real-time updates.`,
 				return fmt.Errorf("unknown metrics source: %s (use 'mock' or 'k8s')", metricsStr)
 			}
 
-			// 3. Create the LLM engine
+			// 3. Create the LLM engine with rule-based fallback
 			llmClient := llm.NewClient(ollamaURL, model)
-			engine := llm.NewEngine(llmClient)
+			engine := decision.NewFallbackEngine(
+				llm.NewEngine(llmClient),
+				decision.NewRuleBasedEngine(),
+			)
 
 			// 4. Start the monitoring loop in background
-			go styledMonitorLoop(provider, engine, st, interval)
+			go styledMonitorLoop(ctx, provider, engine, st, interval)
 
-			// 5. Start the API server (blocks forever)
+			// 5. Start the API server — returns when ctx is cancelled (SIGTERM/Ctrl-C)
 			server := api.NewServer(st, port)
 			styledLog("API server listening on %s", ui.CyanStyle.Render(":"+port))
-			return server.Start()
+			return server.Start(ctx)
 		},
 	}
 
@@ -120,7 +129,7 @@ with SSE for real-time updates.`,
 	return cmd
 }
 
-func styledMonitorLoop(provider metrics.Provider, engine decision.Engine, st *store.Store, interval time.Duration) {
+func styledMonitorLoop(ctx context.Context, provider metrics.Provider, engine decision.Engine, st *store.Store, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
@@ -132,31 +141,37 @@ func styledMonitorLoop(provider metrics.Provider, engine decision.Engine, st *st
 
 	styledLog("Monitor loop started")
 
-	for range ticker.C {
-		snapshot, err := provider.GetClusterSnapshot()
-		if err != nil {
-			styledLog("%s collecting metrics: %v", ui.RedStyle.Render("ERROR"), err)
-			continue
-		}
+	for {
+		select {
+		case <-ctx.Done():
+			styledLog("Monitor loop stopped")
+			return
+		case <-ticker.C:
+			snapshot, err := provider.GetClusterSnapshot()
+			if err != nil {
+				styledLog("%s collecting metrics: %v", ui.RedStyle.Render("ERROR"), err)
+				continue
+			}
 
-		st.SetSnapshot(snapshot)
+			st.SetSnapshot(snapshot)
 
-		decisions, err := engine.Analyze(snapshot)
-		if err != nil {
-			styledLog("%s analyzing: %v", ui.RedStyle.Render("ERROR"), err)
-			continue
-		}
+			decisions, err := engine.Analyze(snapshot)
+			if err != nil {
+				styledLog("%s analyzing: %v", ui.RedStyle.Render("ERROR"), err)
+				continue
+			}
 
-		for _, d := range decisions {
-			st.AddDecision(d)
-			styledLog("Decision: %s %s → %s",
-				ui.SeverityBadge(string(d.Severity)),
-				ui.CyanStyle.Render(d.TargetPod),
-				ui.BlueStyle.Render(string(d.Action)))
-		}
+			for _, d := range decisions {
+				st.AddDecision(d)
+				styledLog("Decision: %s %s → %s",
+					ui.SeverityBadge(string(d.Severity)),
+					ui.CyanStyle.Render(d.TargetPod),
+					ui.BlueStyle.Render(string(d.Action)))
+			}
 
-		if len(decisions) == 0 {
-			styledLog("%s Cycle complete — no issues", ui.CheckMark)
+			if len(decisions) == 0 {
+				styledLog("%s Cycle complete — no issues", ui.CheckMark)
+			}
 		}
 	}
 }
