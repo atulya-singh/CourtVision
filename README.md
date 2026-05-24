@@ -2,6 +2,19 @@
 
 An autonomous Kubernetes controller that uses a local LLM to analyze real-time cluster metrics and make intelligent infrastructure decisions. Instead of blindly restarting failing pods, CourtVision reasons about resource contention, noisy neighbor problems, and capacity constraints — then recommends whether to adjust resource limits, migrate pods to different nodes, or scale deployments.
 
+## Performance
+
+Benchmarks run on Apple M-series (Go 1.22, `go test -bench=. -benchmem`):
+
+| Component | Throughput / Latency | Allocations |
+|-----------|----------------------|-------------|
+| Ring buffer write | 11.1 ns/op (~90M writes/sec) | 0 allocs |
+| Store `AddDecision` | 23.3 ns/op | 0 allocs |
+| Rule engine — 8 pods, 4 nodes | 10.6 µs/op (4.8 µs parallel) | — |
+| LLM response parser — 4 decisions | 8.0 µs/op | — |
+| REST + SSE API (50 concurrent) | 14,000+ req/s, p99 <0.5 ms | — |
+| Agent RSS (idle monitor loop) | ~25 MB | — |
+
 ## How It Works
 
 CourtVision runs a continuous monitoring loop that collects resource metrics from your Kubernetes cluster every few seconds, feeds them to a local LLM (Llama 3 via Ollama), and surfaces structured decisions through a REST API and real-time dashboard.
