@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/atulya-singh/CourtVision/internal/executor"
 	"github.com/atulya-singh/CourtVision/internal/store"
 	"github.com/atulya-singh/CourtVision/internal/types"
 )
@@ -16,11 +17,12 @@ import (
 // Server holds the HTTP server and its dependencies
 type Server struct {
 	store *store.Store
+	exec  executor.Executor
 	port  string
 }
 
-func NewServer(st *store.Store, port string) *Server {
-	return &Server{store: st, port: port}
+func NewServer(st *store.Store, exec executor.Executor, port string) *Server {
+	return &Server{store: st, exec: exec, port: port}
 }
 
 // Start registers all routes and begins listening. It returns when ctx is
@@ -151,22 +153,70 @@ func (s *Server) handleDecisionAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	now := time.Now()
-	found := s.store.UpdateDecision(id, func(d *types.Decision) {
-		d.Executed = action == "approve"
-		d.ExecutedAt = &now
-		if action == "reject" {
-			d.Error = "rejected by operator"
-		}
-	})
-
+	dec, found := s.store.GetDecision(id)
 	if !found {
 		http.Error(w, "decision not found", http.StatusNotFound)
 		return
 	}
 
+	if action == "reject" {
+		now := time.Now()
+		s.store.UpdateAndBroadcast(id, func(d *types.Decision) {
+			d.Status = types.StatusRejected
+			d.Executed = false
+			d.ExecutedAt = &now
+			d.Error = "rejected by operator"
+		})
+		writeJSON(w, map[string]string{"status": "rejected"})
+		return
+	}
+
+	// approve: this is the "ask first" gate. The decision was only ever a
+	// proposal until a human reached this point; now we actually run it.
+	s.executeDecision(r.Context(), &dec)
+	writeJSON(w, map[string]string{"status": string(dec.Status), "error": dec.Error})
+}
+
+// executeDecision runs the approved decision through the executor and records
+// the outcome. It broadcasts an "executing" state first so the dashboard shows
+// the action in flight, runs the (possibly slow) executor without holding any
+// lock, then broadcasts the terminal state. The executor is the only place a
+// real cluster mutation can happen, so all the safety wrapping lives around
+// this single call.
+func (s *Server) executeDecision(ctx context.Context, dec *types.Decision) {
+	s.store.UpdateAndBroadcast(dec.ID, func(d *types.Decision) {
+		d.Status = types.StatusExecuting
+	})
+
+	execCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	err := s.exec.Execute(execCtx, dec)
+	now := time.Now()
+
+	s.store.UpdateAndBroadcast(dec.ID, func(d *types.Decision) {
+		d.ExecutedAt = &now
+		if err != nil {
+			d.Status = types.StatusFailed
+			d.Executed = false
+			d.Error = err.Error()
+			log.Printf("execution failed for %s (%s on %s): %v", d.ID, d.Action, d.TargetPod, err)
+			return
+		}
+		d.Status = types.StatusExecuted
+		d.Executed = true
+		d.Error = ""
+	})
+
+	// Reflect the terminal state back to the caller of executeDecision.
+	if updated, ok := s.store.GetDecision(dec.ID); ok {
+		*dec = updated
+	}
+}
+
+func writeJSON(w http.ResponseWriter, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": action + "d"})
+	json.NewEncoder(w).Encode(v)
 }
 
 func corsMiddleware(next http.Handler) http.Handler {

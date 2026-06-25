@@ -23,6 +23,22 @@ const (
 	SeverityCritical Severity = "critical"
 )
 
+// DecisionStatus tracks where a decision is in its lifecycle. A decision starts
+// as "pending" (the agent proposed it but nothing has happened), waits for a
+// human to approve or reject it, and ends in a terminal state once the executor
+// has run. Informational decisions (Action == none) are born "none" because
+// there is nothing to approve.
+type DecisionStatus string
+
+const (
+	StatusNone      DecisionStatus = "none"      // informational, no action to take
+	StatusPending   DecisionStatus = "pending"   // proposed, waiting for human approval
+	StatusExecuting DecisionStatus = "executing" // approved, executor is running
+	StatusExecuted  DecisionStatus = "executed"  // executor finished successfully
+	StatusFailed    DecisionStatus = "failed"    // executor returned an error
+	StatusRejected  DecisionStatus = "rejected"  // human declined the action
+)
+
 // PodMetrics holds realt-time resource usage for a single pod
 type PodMetrics struct {
 	PodName         string    `json:"pod_name"`
@@ -86,9 +102,11 @@ type Decision struct {
 	Reasoning   string     `json:"reasoning"`               //LLM's explanation
 	NewCPULimit float64    `json:"new_cpu_limit,omitempty"` //patch_limits
 	NewMemLimit float64    `json:"new_mem_limit,omitempty"` //for patch_limits
-	Executed    bool       `json:"executed"`
-	ExecutedAt  *time.Time `json:"executed_at,omitempty"`
-	Error       string     `json:"error,omitempty"`
+
+	Status     DecisionStatus `json:"status"` // lifecycle: none/pending/executing/executed/failed/rejected
+	Executed   bool           `json:"executed"`
+	ExecutedAt *time.Time     `json:"executed_at,omitempty"`
+	Error      string         `json:"error,omitempty"`
 }
 
 // ClusterSnapshot is the full picture sent to the LLM for analysis

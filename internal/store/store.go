@@ -9,7 +9,7 @@ import (
 type Store struct {
 	mu        sync.RWMutex
 	snapshot  *types.ClusterSnapshot
-	decisions *RingBuffer          // ring buffer of last 1000 decisions
+	decisions *RingBuffer           // ring buffer of last 1000 decisions
 	listeners []chan types.Decision // sse subscribers
 }
 
@@ -118,6 +118,46 @@ func (s *Store) UpdateDecision(id string, update func(*types.Decision)) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.decisions.FindAndUpdate(id, update)
+}
+
+// GetDecision returns a copy of the decision with the given ID. The copy means
+// callers (like the executor) can read and pass it around without holding the
+// store lock while they do slow work such as calling the Kubernetes API.
+func (s *Store) GetDecision(id string) (types.Decision, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, d := range s.decisions.ReadAll() {
+		if d.ID == id {
+			return d, true
+		}
+	}
+	return types.Decision{}, false
+}
+
+// UpdateAndBroadcast applies update to the stored decision and then pushes the
+// updated decision to every SSE listener, so the dashboard reflects a state
+// change (pending -> executing -> executed) the moment it happens rather than
+// waiting for the next poll.
+func (s *Store) UpdateAndBroadcast(id string, update func(*types.Decision)) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var updated types.Decision
+	found := s.decisions.FindAndUpdate(id, func(d *types.Decision) {
+		update(d)
+		updated = *d
+	})
+	if !found {
+		return false
+	}
+
+	for _, ch := range s.listeners {
+		select {
+		case ch <- updated:
+		default:
+		}
+	}
+	return true
 }
 
 func (s *Store) Unsubscribe(ch chan types.Decision) {

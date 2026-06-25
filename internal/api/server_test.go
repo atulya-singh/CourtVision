@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -8,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/atulya-singh/CourtVision/internal/executor"
 	"github.com/atulya-singh/CourtVision/internal/store"
 	"github.com/atulya-singh/CourtVision/internal/types"
 )
@@ -16,7 +18,7 @@ import (
 
 func newServer() (*Server, *store.Store) {
 	st := store.New()
-	return NewServer(st, "0"), st
+	return NewServer(st, executor.NewMockExecutor(), "0"), st
 }
 
 func get(t *testing.T, srv *Server, path string) *httptest.ResponseRecorder {
@@ -211,6 +213,74 @@ func TestHandleDecisionAction_Reject(t *testing.T) {
 	}
 	if decisions[0].Error == "" {
 		t.Error("rejected decision should have an error message set")
+	}
+}
+
+// failingExecutor lets us exercise the error path of the approve flow.
+type failingExecutor struct{}
+
+func (failingExecutor) Execute(context.Context, *types.Decision) error {
+	return errTest
+}
+
+var errTest = &testError{"boom"}
+
+type testError struct{ msg string }
+
+func (e *testError) Error() string { return e.msg }
+
+func TestHandleDecisionAction_Approve_SetsExecutedStatus(t *testing.T) {
+	srv, st := newServer()
+	addDecision(st, "id-1")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/decisions/id-1/approve", nil)
+	w := httptest.NewRecorder()
+	srv.handleDecisionAction(w, req)
+
+	d := st.GetDecisions()[0]
+	if d.Status != types.StatusExecuted {
+		t.Errorf("want status %q, got %q", types.StatusExecuted, d.Status)
+	}
+	if !d.Executed {
+		t.Error("approved+executed decision should have Executed=true")
+	}
+}
+
+func TestHandleDecisionAction_Approve_ExecutorFailure(t *testing.T) {
+	st := store.New()
+	srv := NewServer(st, failingExecutor{}, "0")
+	addDecision(st, "id-1")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/decisions/id-1/approve", nil)
+	w := httptest.NewRecorder()
+	srv.handleDecisionAction(w, req)
+
+	d := st.GetDecisions()[0]
+	if d.Status != types.StatusFailed {
+		t.Errorf("want status %q, got %q", types.StatusFailed, d.Status)
+	}
+	if d.Executed {
+		t.Error("a failed execution must not be marked Executed")
+	}
+	if d.Error == "" {
+		t.Error("a failed execution should record the error")
+	}
+}
+
+func TestHandleDecisionAction_Reject_SetsRejectedStatus(t *testing.T) {
+	srv, st := newServer()
+	addDecision(st, "id-1")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/decisions/id-1/reject", nil)
+	w := httptest.NewRecorder()
+	srv.handleDecisionAction(w, req)
+
+	d := st.GetDecisions()[0]
+	if d.Status != types.StatusRejected {
+		t.Errorf("want status %q, got %q", types.StatusRejected, d.Status)
+	}
+	if d.Executed {
+		t.Error("rejected decision must not be executed")
 	}
 }
 

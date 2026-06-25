@@ -12,9 +12,11 @@ import (
 
 	"github.com/atulya-singh/CourtVision/internal/api"
 	"github.com/atulya-singh/CourtVision/internal/decision"
+	"github.com/atulya-singh/CourtVision/internal/executor"
 	"github.com/atulya-singh/CourtVision/internal/llm"
 	"github.com/atulya-singh/CourtVision/internal/metrics"
 	"github.com/atulya-singh/CourtVision/internal/store"
+	"github.com/atulya-singh/CourtVision/internal/types"
 	"github.com/atulya-singh/CourtVision/internal/ui"
 	"github.com/spf13/cobra"
 )
@@ -108,11 +110,32 @@ with SSE for real-time updates.`,
 				decision.NewRuleBasedEngine(),
 			)
 
-			// 4. Start the monitoring loop in background
+			// 4. Choose how approved decisions get executed.
+			//    --dry-run (default) never mutates anything, whatever the source.
+			//    Otherwise mock metrics pair with a simulated executor and a real
+			//    cluster pairs with the real one.
+			var exec executor.Executor
+			switch {
+			case dryRun:
+				styledLog("Executor: %s", ui.DryRunBadge)
+				exec = executor.NewDryRunExecutor()
+			case metricsStr == "k8s":
+				styledLog("Executor: %s", ui.GreenStyle.Render("LIVE Kubernetes"))
+				var err error
+				exec, err = executor.NewK8sExecutor()
+				if err != nil {
+					return fmt.Errorf("failed to create k8s executor: %w", err)
+				}
+			default:
+				styledLog("Executor: %s", ui.CyanStyle.Render("mock (simulated)"))
+				exec = executor.NewMockExecutor()
+			}
+
+			// 5. Start the monitoring loop in background
 			go styledMonitorLoop(ctx, provider, engine, st, interval)
 
-			// 5. Start the API server — returns when ctx is cancelled (SIGTERM/Ctrl-C)
-			server := api.NewServer(st, port)
+			// 6. Start the API server — returns when ctx is cancelled (SIGTERM/Ctrl-C)
+			server := api.NewServer(st, exec, port)
 			styledLog("API server listening on %s", ui.CyanStyle.Render(":"+port))
 			return server.Start(ctx)
 		},
@@ -162,6 +185,13 @@ func styledMonitorLoop(ctx context.Context, provider metrics.Provider, engine de
 			}
 
 			for _, d := range decisions {
+				// Decisions that propose a real action wait for human approval;
+				// informational ones (action == none) have nothing to approve.
+				if d.Action == types.ActionNone {
+					d.Status = types.StatusNone
+				} else {
+					d.Status = types.StatusPending
+				}
 				st.AddDecision(d)
 				styledLog("Decision: %s %s → %s",
 					ui.SeverityBadge(string(d.Severity)),
