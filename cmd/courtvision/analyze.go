@@ -92,6 +92,8 @@ func analyzeCmd() *cobra.Command {
 		metricsStr string
 		output     string
 		namespace  string
+		apply      bool
+		dryRun     bool
 	)
 
 	cmd := &cobra.Command{
@@ -158,12 +160,27 @@ AI-powered analysis.`,
 			// 4. Output results
 			switch output {
 			case "json":
-				return printJSON(final.result.decisions)
+				if err := printJSON(final.result.decisions); err != nil {
+					return err
+				}
 			case "table":
-				return printStyledTable(final.result.decisions, metricsStr, final.result.elapsed)
+				if err := printStyledTable(final.result.decisions, metricsStr, final.result.elapsed); err != nil {
+					return err
+				}
 			default:
 				return fmt.Errorf("unknown output format: %s (use 'json' or 'table')", output)
 			}
+
+			// 5. Optionally walk the decisions and approve/reject each one.
+			if apply {
+				exec, label, err := buildExecutor(metricsStr, dryRun)
+				if err != nil {
+					return fmt.Errorf("failed to create executor: %w", err)
+				}
+				fmt.Printf("\n  %s %s\n\n", ui.DimStyle.Render("Executor:"), ui.CyanStyle.Render(label))
+				return runApply(final.result.decisions, exec, label)
+			}
+			return nil
 		},
 	}
 
@@ -172,6 +189,8 @@ AI-powered analysis.`,
 	cmd.Flags().StringVar(&metricsStr, "metrics", "mock", "Metrics source (mock or k8s)")
 	cmd.Flags().StringVar(&output, "output", "table", "Output format (table or json)")
 	cmd.Flags().StringVar(&namespace, "namespace", "", "Kubernetes namespace to watch (empty = all)")
+	cmd.Flags().BoolVar(&apply, "apply", false, "Interactively approve/reject each decision and run approved ones")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", true, "When applying, log actions without executing them")
 
 	return cmd
 }

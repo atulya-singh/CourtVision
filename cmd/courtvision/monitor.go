@@ -12,7 +12,6 @@ import (
 
 	"github.com/atulya-singh/CourtVision/internal/api"
 	"github.com/atulya-singh/CourtVision/internal/decision"
-	"github.com/atulya-singh/CourtVision/internal/executor"
 	"github.com/atulya-singh/CourtVision/internal/llm"
 	"github.com/atulya-singh/CourtVision/internal/metrics"
 	"github.com/atulya-singh/CourtVision/internal/store"
@@ -110,26 +109,14 @@ with SSE for real-time updates.`,
 				decision.NewRuleBasedEngine(),
 			)
 
-			// 4. Choose how approved decisions get executed.
-			//    --dry-run (default) never mutates anything, whatever the source.
-			//    Otherwise mock metrics pair with a simulated executor and a real
-			//    cluster pairs with the real one.
-			var exec executor.Executor
-			switch {
-			case dryRun:
-				styledLog("Executor: %s", ui.DryRunBadge)
-				exec = executor.NewDryRunExecutor()
-			case metricsStr == "k8s":
-				styledLog("Executor: %s", ui.GreenStyle.Render("LIVE Kubernetes"))
-				var err error
-				exec, err = executor.NewK8sExecutor()
-				if err != nil {
-					return fmt.Errorf("failed to create k8s executor: %w", err)
-				}
-			default:
-				styledLog("Executor: %s", ui.CyanStyle.Render("mock (simulated)"))
-				exec = executor.NewMockExecutor()
+			// 4. Choose how approved decisions get executed. buildExecutor is
+			//    the shared safety switch: --dry-run never mutates anything, a
+			//    real cluster gets the real executor, mock gets a simulated one.
+			exec, execLabel, err := buildExecutor(metricsStr, dryRun)
+			if err != nil {
+				return fmt.Errorf("failed to create executor: %w", err)
 			}
+			styledLog("Executor: %s", ui.CyanStyle.Render(execLabel))
 
 			// 5. Start the monitoring loop in background
 			go styledMonitorLoop(ctx, provider, engine, st, interval)
