@@ -159,6 +159,14 @@ func (s *Server) handleDecisionAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Guard against acting twice on the same decision. Without this, a
+	// double-click or a retried request could run a scale-down or eviction
+	// twice. A terminal/in-flight decision is off-limits.
+	if dec.Status == types.StatusExecuting || dec.Status == types.StatusExecuted {
+		http.Error(w, "decision already "+string(dec.Status), http.StatusConflict)
+		return
+	}
+
 	if action == "reject" {
 		now := time.Now()
 		s.store.UpdateAndBroadcast(id, func(d *types.Decision) {
@@ -173,7 +181,7 @@ func (s *Server) handleDecisionAction(w http.ResponseWriter, r *http.Request) {
 
 	// approve: this is the "ask first" gate. The decision was only ever a
 	// proposal until a human reached this point; now we actually run it.
-	s.executeDecision(r.Context(), &dec)
+	s.executeDecision(&dec)
 	writeJSON(w, map[string]string{"status": string(dec.Status), "error": dec.Error})
 }
 
@@ -183,12 +191,16 @@ func (s *Server) handleDecisionAction(w http.ResponseWriter, r *http.Request) {
 // lock, then broadcasts the terminal state. The executor is the only place a
 // real cluster mutation can happen, so all the safety wrapping lives around
 // this single call.
-func (s *Server) executeDecision(ctx context.Context, dec *types.Decision) {
+//
+// It deliberately uses a fresh background context rather than the request's:
+// once we have committed to mutating the cluster, a browser disconnect must not
+// cancel the action half-done. The 30s timeout still bounds it.
+func (s *Server) executeDecision(dec *types.Decision) {
 	s.store.UpdateAndBroadcast(dec.ID, func(d *types.Decision) {
 		d.Status = types.StatusExecuting
 	})
 
-	execCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	execCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	err := s.exec.Execute(execCtx, dec)

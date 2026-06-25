@@ -267,6 +267,19 @@ func TestHandleDecisionAction_Approve_ExecutorFailure(t *testing.T) {
 	}
 }
 
+func TestHandleDecisionAction_RejectsAlreadyExecuted(t *testing.T) {
+	srv, st := newServer()
+	st.AddDecision(types.Decision{ID: "id-1", Action: types.ActionScaleDown, Status: types.StatusExecuted})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/decisions/id-1/approve", nil)
+	w := httptest.NewRecorder()
+	srv.handleDecisionAction(w, req)
+
+	if w.Code != http.StatusConflict {
+		t.Errorf("want 409 for re-approving an executed decision, got %d", w.Code)
+	}
+}
+
 func TestHandleDecisionAction_Reject_SetsRejectedStatus(t *testing.T) {
 	srv, st := newServer()
 	addDecision(st, "id-1")

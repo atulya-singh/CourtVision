@@ -186,7 +186,23 @@ export default function DecisionFeed() {
       prev.map((d) => (d.id === id ? { ...d, status: optimistic } : d))
     )
 
-    fetch(`/api/decisions/${id}/${action}`, { method: 'POST' }).catch(console.error)
+    // If the action is rejected (e.g. another operator already handled it, 409)
+    // or the network fails, our optimistic guess is wrong. Re-sync from the
+    // server so the card shows the real state instead of a stuck "executing".
+    fetch(`/api/decisions/${id}/${action}`, { method: 'POST' })
+      .then((r) => {
+        if (!r.ok) return resync()
+      })
+      .catch(() => resync())
+  }
+
+  const resync = () => {
+    fetch('/api/decisions')
+      .then((r) => r.json())
+      .then((data: Decision[]) => {
+        if (Array.isArray(data)) setDecisions(data.slice().reverse())
+      })
+      .catch(console.error)
   }
 
   return (
