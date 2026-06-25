@@ -1,5 +1,16 @@
 import { useEffect, useRef, useState } from 'react'
 
+// DecisionStatus mirrors types.DecisionStatus on the Go side. It is the single
+// source of truth for where a decision is in its lifecycle, so the UI never has
+// to guess from other fields.
+type DecisionStatus =
+  | 'none'
+  | 'pending'
+  | 'executing'
+  | 'executed'
+  | 'failed'
+  | 'rejected'
+
 interface Decision {
   id: string
   timestamp: string
@@ -9,18 +20,10 @@ interface Decision {
   namespace: string
   target_node?: string
   reasoning: string
+  status: DecisionStatus
   executed: boolean
   executed_at?: string
   error?: string
-}
-
-type DecisionStatus = 'pending' | 'approved' | 'rejected'
-
-function getStatus(d: Decision): DecisionStatus {
-  if (d.executed_at && d.error === 'rejected by operator') return 'rejected'
-  if (d.executed_at && d.executed) return 'approved'
-  if (d.executed) return 'approved'
-  return 'pending'
 }
 
 const severityStyles: Record<string, string> = {
@@ -42,22 +45,35 @@ function SeverityBadge({ severity }: { severity: string }) {
   )
 }
 
+const statusStyles: Record<DecisionStatus, { label: string; className: string } | null> = {
+  none: null,
+  pending: null,
+  executing: {
+    label: 'EXECUTING',
+    className: 'bg-yellow-500/20 text-yellow-400 border-yellow-500/40 animate-pulse',
+  },
+  executed: {
+    label: 'EXECUTED',
+    className: 'bg-green-500/20 text-green-400 border-green-500/40',
+  },
+  failed: {
+    label: 'FAILED',
+    className: 'bg-red-500/20 text-red-400 border-red-500/40',
+  },
+  rejected: {
+    label: 'REJECTED',
+    className: 'bg-gray-500/20 text-gray-400 border-gray-500/40',
+  },
+}
+
 function StatusBadge({ status }: { status: DecisionStatus }) {
-  if (status === 'approved') {
-    return (
-      <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-green-500/20 text-green-400 border border-green-500/40">
-        APPROVED
-      </span>
-    )
-  }
-  if (status === 'rejected') {
-    return (
-      <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-red-500/20 text-red-400 border border-red-500/40">
-        REJECTED
-      </span>
-    )
-  }
-  return null
+  const style = statusStyles[status]
+  if (!style) return null
+  return (
+    <span className={`text-xs font-semibold px-2 py-0.5 rounded-full border ${style.className}`}>
+      {style.label}
+    </span>
+  )
 }
 
 function DecisionCard({
@@ -70,7 +86,7 @@ function DecisionCard({
   onAction: (id: string, action: 'approve' | 'reject') => void
 }) {
   const time = new Date(decision.timestamp).toLocaleTimeString()
-  const status = getStatus(decision)
+  const status = decision.status
 
   return (
     <div
@@ -90,6 +106,9 @@ function DecisionCard({
         <span className="text-gray-500 text-sm ml-2">{decision.action.replace(/_/g, ' ')}</span>
       </div>
       <p className="text-sm text-gray-400 leading-relaxed mb-3">{decision.reasoning}</p>
+      {status === 'failed' && decision.error && (
+        <p className="text-xs text-red-400 mb-3">Execution failed: {decision.error}</p>
+      )}
       {status === 'pending' && (
         <div className="flex gap-2">
           <button
@@ -133,11 +152,22 @@ export default function DecisionFeed() {
 
     es.addEventListener('connected', () => setConnected(true))
 
+    // The server sends a "decision" event both for brand-new decisions and for
+    // state changes to existing ones (pending -> executing -> executed). So we
+    // upsert by id: replace the card if we already have it, otherwise prepend.
     es.addEventListener('decision', (e) => {
       const decision: Decision = JSON.parse(e.data)
-      newIdsRef.current.add(decision.id)
-      setDecisions((prev) => [decision, ...prev])
-      setTimeout(() => newIdsRef.current.delete(decision.id), 600)
+      setDecisions((prev) => {
+        const idx = prev.findIndex((d) => d.id === decision.id)
+        if (idx >= 0) {
+          const next = prev.slice()
+          next[idx] = decision
+          return next
+        }
+        newIdsRef.current.add(decision.id)
+        setTimeout(() => newIdsRef.current.delete(decision.id), 600)
+        return [decision, ...prev]
+      })
     })
 
     es.onerror = () => setConnected(false)
@@ -147,21 +177,16 @@ export default function DecisionFeed() {
   }, [])
 
   const handleAction = (id: string, action: 'approve' | 'reject') => {
-    fetch(`/api/decisions/${id}/${action}`, { method: 'POST' })
-      .then((r) => {
-        if (!r.ok) throw new Error('Failed')
-        setDecisions((prev) =>
-          prev.map((d) => {
-            if (d.id !== id) return d
-            const now = new Date().toISOString()
-            if (action === 'approve') {
-              return { ...d, executed: true, executed_at: now }
-            }
-            return { ...d, executed: false, executed_at: now, error: 'rejected by operator' }
-          })
-        )
-      })
-      .catch(console.error)
+    // Optimistically move the card out of "pending" so the buttons disappear
+    // immediately and can't be double-clicked. The server then streams back the
+    // real terminal state (executed/failed/rejected) over SSE, which the upsert
+    // handler above applies on top of this.
+    const optimistic: DecisionStatus = action === 'approve' ? 'executing' : 'rejected'
+    setDecisions((prev) =>
+      prev.map((d) => (d.id === id ? { ...d, status: optimistic } : d))
+    )
+
+    fetch(`/api/decisions/${id}/${action}`, { method: 'POST' }).catch(console.error)
   }
 
   return (
