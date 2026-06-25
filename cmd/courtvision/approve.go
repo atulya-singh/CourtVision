@@ -7,10 +7,24 @@ import (
 	"time"
 
 	"github.com/atulya-singh/CourtVision/internal/executor"
+	"github.com/atulya-singh/CourtVision/internal/metrics"
 	"github.com/atulya-singh/CourtVision/internal/types"
 	"github.com/atulya-singh/CourtVision/internal/ui"
 	tea "github.com/charmbracelet/bubbletea"
 )
+
+// makeProvider builds a metrics source by name. Shared so every entry point
+// (analyze, monitor, the REPL) speaks the same flag vocabulary.
+func makeProvider(source, namespace string) (metrics.Provider, error) {
+	switch source {
+	case "mock":
+		return metrics.NewMockProvider(), nil
+	case "k8s":
+		return metrics.NewK8sProvider(namespace)
+	default:
+		return nil, fmt.Errorf("unknown metrics source: %s (use 'mock' or 'k8s')", source)
+	}
+}
 
 // statusSkipped is a CLI-only outcome: the operator chose neither to run nor to
 // reject a decision, so it stays pending for a later pass. It is not part of the

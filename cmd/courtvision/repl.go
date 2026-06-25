@@ -8,6 +8,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/atulya-singh/CourtVision/internal/decision"
+	"github.com/atulya-singh/CourtVision/internal/executor"
+	"github.com/atulya-singh/CourtVision/internal/llm"
+	"github.com/atulya-singh/CourtVision/internal/types"
 	"github.com/atulya-singh/CourtVision/internal/ui"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -70,6 +74,18 @@ func checkConnStatus() tea.Msg {
 
 // ── Model ─────────────────────────────────────────────────────────────────────
 
+// replMode is what the REPL is currently doing. In modeInput it behaves like a
+// normal prompt; in modeReview it temporarily becomes an approval screen that
+// walks the operator through proposed decisions, like Claude Code's accept/reject
+// flow. Reusing the same Bubbletea program (rather than launching a nested one)
+// is what makes the inline review possible.
+type replMode int
+
+const (
+	modeInput replMode = iota
+	modeReview
+)
+
 type replModel struct {
 	textInput textinput.Model
 	rootCmd   *cobra.Command
@@ -79,6 +95,13 @@ type replModel struct {
 	status    connStatus
 	width     int
 	quitting  bool
+
+	// review-mode state
+	mode      replMode
+	session   *reviewSession
+	exec      executor.Executor
+	reviewAll bool // operator chose "approve all remaining"
+	working   bool // an executor call is in flight
 }
 
 func newREPL(rootCmd *cobra.Command) replModel {
@@ -117,7 +140,17 @@ func (m replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.status = connStatus(msg)
 		return m, nil
 
+	case reviewLoadedMsg:
+		return m.onReviewLoaded(msg)
+
+	case execDoneMsg:
+		return m.onExecDone(msg)
+
 	case tea.KeyMsg:
+		// In review mode the keyboard drives the approval flow, not the prompt.
+		if m.mode == modeReview {
+			return m.updateReview(msg)
+		}
 		switch msg.Type {
 		case tea.KeyCtrlC:
 			m.quitting = true
@@ -185,6 +218,15 @@ func (m replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 
+			// Handle interactive review: analyze the cluster, then step through
+			// the proposed actions inline. Runs in this same program (no nested
+			// TUI), which is why it lives here instead of as a cobra command.
+			fields := strings.Fields(input)
+			if fields[0] == "review" {
+				m.output = append(m.output, ui.DimStyle.Render("  Analyzing cluster..."))
+				return m, startReview(fields[1:])
+			}
+
 			// Execute subcommand and refresh status
 			result := executeCommand(m.rootCmd, input)
 			if result != "" {
@@ -199,6 +241,160 @@ func (m replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+// ── Interactive review (in-REPL approval flow) ──────────────────────────────
+
+// reviewLoadedMsg carries the result of analyzing the cluster for review.
+type reviewLoadedMsg struct {
+	decisions []types.Decision
+	exec      executor.Executor
+	label     string
+	err       error
+}
+
+// startReview analyzes the cluster off the UI thread and hands the proposed
+// decisions back as a message. For safety the REPL never mutates a real cluster:
+// mock metrics get a simulated executor, while k8s falls back to dry-run. Real
+// changes are reserved for `analyze --apply` and the monitor, which ask for it
+// explicitly.
+func startReview(args []string) tea.Cmd {
+	metricsSource := "mock"
+	namespace := ""
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--metrics":
+			if i+1 < len(args) {
+				metricsSource = args[i+1]
+				i++
+			}
+		case "--namespace":
+			if i+1 < len(args) {
+				namespace = args[i+1]
+				i++
+			}
+		}
+	}
+
+	return func() tea.Msg {
+		provider, err := makeProvider(metricsSource, namespace)
+		if err != nil {
+			return reviewLoadedMsg{err: err}
+		}
+		engine := decision.NewFallbackEngine(
+			llm.NewEngine(llm.NewClient("http://localhost:11434", "llama3")),
+			decision.NewRuleBasedEngine(),
+		)
+		snapshot, err := provider.GetClusterSnapshot()
+		if err != nil {
+			return reviewLoadedMsg{err: err}
+		}
+		decisions, err := engine.Analyze(snapshot)
+		if err != nil {
+			return reviewLoadedMsg{err: err}
+		}
+		exec, label, err := buildExecutor(metricsSource, metricsSource == "k8s")
+		if err != nil {
+			return reviewLoadedMsg{err: err}
+		}
+		return reviewLoadedMsg{decisions: decisions, exec: exec, label: label}
+	}
+}
+
+func (m replModel) onReviewLoaded(msg reviewLoadedMsg) (tea.Model, tea.Cmd) {
+	if msg.err != nil {
+		m.output = append(m.output, errorStyle.Render("  Error: "+msg.err.Error()))
+		return m, nil
+	}
+	session := newReviewSession(msg.decisions)
+	if session.total() == 0 {
+		m.output = append(m.output, ui.DimStyle.Render(
+			fmt.Sprintf("  Nothing to review — %d decision(s), none actionable.", len(msg.decisions))))
+		return m, nil
+	}
+	m.mode = modeReview
+	m.session = session
+	m.exec = msg.exec
+	m.reviewAll = false
+	m.working = false
+	m.output = append(m.output, ui.DimStyle.Render("  Executor: "+msg.label))
+	return m, nil
+}
+
+func (m replModel) updateReview(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.working {
+		return m, nil // ignore input while an action runs
+	}
+	switch msg.String() {
+	case "a", "y":
+		m.working = true
+		return m, runExecutor(m.exec, m.session.current())
+	case "A":
+		m.reviewAll = true
+		m.working = true
+		return m, runExecutor(m.exec, m.session.current())
+	case "r", "n":
+		m = m.recordAndLog(types.StatusRejected, "")
+		return m.afterReviewStep(), nil
+	case "s":
+		m = m.recordAndLog(statusSkipped, "")
+		return m.afterReviewStep(), nil
+	case "q", "esc":
+		m = m.exitReview(true)
+		return m, nil
+	case "ctrl+c":
+		m.quitting = true
+		return m, tea.Quit
+	}
+	return m, nil
+}
+
+func (m replModel) onExecDone(msg execDoneMsg) (tea.Model, tea.Cmd) {
+	errStr := ""
+	if msg.err != nil {
+		errStr = msg.err.Error()
+	}
+	m = m.recordAndLog(msg.status, errStr)
+	m.working = false
+	// A failure pauses "approve all" so the operator can react.
+	if msg.status == types.StatusFailed {
+		m.reviewAll = false
+	}
+	if m.session.done() {
+		return m.exitReview(false), nil
+	}
+	if m.reviewAll {
+		m.working = true
+		return m, runExecutor(m.exec, m.session.current())
+	}
+	return m, nil
+}
+
+func (m replModel) recordAndLog(status types.DecisionStatus, errStr string) replModel {
+	m.session.record(status, errStr)
+	m.output = append(m.output, renderOutcome(m.session.outcomes[len(m.session.outcomes)-1]))
+	return m
+}
+
+func (m replModel) afterReviewStep() replModel {
+	if m.session.done() {
+		return m.exitReview(false)
+	}
+	return m
+}
+
+func (m replModel) exitReview(aborted bool) replModel {
+	if aborted {
+		m.output = append(m.output, ui.DimStyle.Render("  Review cancelled."))
+	} else {
+		m.output = append(m.output, renderSummary(m.session))
+	}
+	m.mode = modeInput
+	m.session = nil
+	m.exec = nil
+	m.reviewAll = false
+	m.working = false
+	return m
+}
+
 func (m replModel) View() string {
 	if m.quitting {
 		return goodbyeStyle.Render("  Goodbye!") + "\n"
@@ -210,6 +406,18 @@ func (m replModel) View() string {
 	if len(m.output) > 0 {
 		b.WriteString(strings.Join(m.output, "\n"))
 		b.WriteString("\n")
+	}
+
+	// ── Review panel (replaces the prompt while reviewing) ────────────────
+	if m.mode == modeReview && m.session != nil && !m.session.done() {
+		b.WriteString("\n")
+		b.WriteString(renderDecisionPrompt(m.session.current(), m.session.idx+1, m.session.total()))
+		if m.working {
+			b.WriteString(ui.YellowStyle.Render("  executing...") + "\n")
+		} else {
+			b.WriteString(reviewHint() + "\n")
+		}
+		return b.String()
 	}
 
 	// ── Input box (always at the bottom) ──────────────────────────────────
@@ -265,6 +473,7 @@ func renderHelp() string {
 	commands := []struct{ name, desc string }{
 		{"monitor", "Start the monitoring agent"},
 		{"analyze", "Run a one-shot cluster analysis"},
+		{"review", "Analyze, then approve/reject each action inline"},
 		{"status", "Check connectivity to Ollama and Kubernetes"},
 		{"version", "Print version information"},
 		{"clear", "Clear output"},
