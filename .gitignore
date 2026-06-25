@@ -1,0 +1,9 @@
+# Compiled binary
+/courtvision
+
+# macOS
+.DS_Store
+
+# Go
+*.test
+*.out
