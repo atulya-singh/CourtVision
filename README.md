@@ -225,6 +225,19 @@ Every major component is behind an interface — `metrics.Provider`, `decision.E
 - **React + TypeScript + Tailwind** — dashboard frontend
 - **Server-Sent Events** — real-time streaming
 
+## Roadmap
+
+Things still on the list, roughly in priority order:
+
+- [ ] **Non-blocking LLM analysis** — the monitor loop currently blocks while Ollama thinks, stalling the whole cycle when the model is slow or down. Add a timeout and run analysis asynchronously.
+- [ ] **Persistent audit log** — decisions and executions live only in an in-memory ring buffer. Anything that mutates a real cluster needs a durable, on-disk record of what changed and why.
+- [ ] **Verify the K8s executor against a live cluster** — it compiles and is written carefully but has not been run against a real cluster. Test on a throwaway Kind cluster before trusting it.
+- [ ] **Multi-container `patch_limits`** — currently only the first container in a pod gets patched.
+- [ ] **Honor `target_node` in `evict_and_move`** — eviction is best-effort and does not yet pin the pod to the chosen node.
+- [ ] **Graduated autonomy levels** — the executor foundation supports it, but the tool is still hardwired to "ask first." Add an `auto-safe` mode that auto-runs only reversible actions, and a full-auto mode.
+- [ ] **Fix version mismatch** — `go.mod` requires Go 1.26.1 but this README's install section still says 1.22+.
+- [ ] **Document `review` and `analyze --apply`** — the new interactive approval flows in the REPL and CLI are not yet covered in the CLI Reference above.
+
 ## License
 
 MIT
