@@ -94,7 +94,7 @@ func buildExecutor(metricsSource string, dryRun bool) (executor.Executor, string
 	case dryRun:
 		return executor.NewDryRunExecutor(), "dry-run (no changes)", nil
 	case metricsSource == "k8s":
-		e, err := executor.NewK8sExecutor()
+		e, err := executor.NewK8sExecutor("")
 		if err != nil {
 			return nil, "", err
 		}

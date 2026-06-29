@@ -25,14 +25,22 @@ type K8sExecutor struct {
 }
 
 // NewK8sExecutor builds a client from the local kubeconfig, the same way the
-// metrics provider does. It does not talk to the cluster yet; failures here are
-// only about loading credentials.
-func NewK8sExecutor() (*K8sExecutor, error) {
+// metrics provider does. contextName selects which kubeconfig context to target
+// so each ClusterWorker can mutate its own cluster; passing "" falls back to the
+// kubeconfig current-context. It does not talk to the cluster yet; failures here
+// are only about loading credentials.
+func NewK8sExecutor(contextName string) (*K8sExecutor, error) {
 	home := homedir.HomeDir()
 	if home == "" {
 		return nil, fmt.Errorf("could not find home directory")
 	}
-	cfg, err := clientcmd.BuildConfigFromFlags("", filepath.Join(home, ".kube", "config"))
+
+	loadingRules := &clientcmd.ClientConfigLoadingRules{ExplicitPath: filepath.Join(home, ".kube", "config")}
+	overrides := &clientcmd.ConfigOverrides{}
+	if contextName != "" {
+		overrides.CurrentContext = contextName
+	}
+	cfg, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, overrides).ClientConfig()
 	if err != nil {
 		return nil, fmt.Errorf("failed to load kubeconfig: %w", err)
 	}
