@@ -116,7 +116,7 @@ AI-powered analysis.`,
 			case "mock":
 				provider = metrics.NewMockProvider()
 			case "k8s":
-				p, err := metrics.NewK8sProvider(namespace)
+				p, err := metrics.NewK8sProvider(namespace, "")
 				if err != nil {
 					return fmt.Errorf("failed to connect to cluster: %w", err)
 				}

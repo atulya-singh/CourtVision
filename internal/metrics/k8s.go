@@ -20,18 +20,40 @@ type K8sProvider struct {
 	coreClient    kubernetes.Interface
 	metricsClient metricsv.Interface
 	namespace     string
+	clusterName   string
 }
 
-func NewK8sProvider(namespace string) (*K8sProvider, error) {
+// NewK8sProvider builds a provider for a single cluster. contextName selects
+// which kubeconfig context to target; passing "" falls back to the kubeconfig's
+// current-context (the original single-cluster behavior). The resolved context
+// name is stamped onto every snapshot so decisions can be attributed to the
+// right cluster in a multi-cluster setup.
+func NewK8sProvider(namespace, contextName string) (*K8sProvider, error) {
 	home := homedir.HomeDir()
 	if home == "" {
 		return nil, fmt.Errorf("could not find home directory")
 	}
 	kubeconfigPath := filepath.Join(home, ".kube", "config")
 
-	config, err := clientcmd.BuildConfigFromFlags("", kubeconfigPath)
+	loadingRules := &clientcmd.ClientConfigLoadingRules{ExplicitPath: kubeconfigPath}
+	overrides := &clientcmd.ConfigOverrides{}
+	if contextName != "" {
+		overrides.CurrentContext = contextName
+	}
+	clientConfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, overrides)
+
+	config, err := clientConfig.ClientConfig()
 	if err != nil {
 		return nil, fmt.Errorf("failed to load kubeconfig: %w", err)
+	}
+
+	// Resolve the effective context name so a caller relying on the
+	// current-context still gets a meaningful cluster label on its snapshots.
+	clusterName := contextName
+	if clusterName == "" {
+		if rawConfig, err := clientConfig.RawConfig(); err == nil {
+			clusterName = rawConfig.CurrentContext
+		}
 	}
 
 	coreClient, err := kubernetes.NewForConfig(config)
@@ -48,6 +70,7 @@ func NewK8sProvider(namespace string) (*K8sProvider, error) {
 		coreClient:    coreClient,
 		metricsClient: metricsClient,
 		namespace:     namespace,
+		clusterName:   clusterName,
 	}, nil
 }
 
@@ -106,7 +129,7 @@ func (k *K8sProvider) GetClusterSnapshot() (*types.ClusterSnapshot, error) {
 		podUsageMap[key] = [2]float64{cpuMillis, memMB}
 	}
 
-	snapshot := &types.ClusterSnapshot{Timestamp: now}
+	snapshot := &types.ClusterSnapshot{ClusterName: k.clusterName, Timestamp: now}
 
 	// Counting total number of pods on each node
 	podCountPerNode := make(map[string]int)

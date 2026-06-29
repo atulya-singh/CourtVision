@@ -94,7 +94,7 @@ with SSE for real-time updates.`,
 			case "k8s":
 				styledLog("Using %s metrics provider", ui.CyanStyle.Render("Kubernetes"))
 				var err error
-				provider, err = metrics.NewK8sProvider(namespace)
+				provider, err = metrics.NewK8sProvider(namespace, "")
 				if err != nil {
 					return fmt.Errorf("failed to create k8s provider: %w", err)
 				}

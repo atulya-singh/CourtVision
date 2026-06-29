@@ -20,7 +20,7 @@ func makeProvider(source, namespace string) (metrics.Provider, error) {
 	case "mock":
 		return metrics.NewMockProvider(), nil
 	case "k8s":
-		return metrics.NewK8sProvider(namespace)
+		return metrics.NewK8sProvider(namespace, "")
 	default:
 		return nil, fmt.Errorf("unknown metrics source: %s (use 'mock' or 'k8s')", source)
 	}
