@@ -18,7 +18,7 @@ import (
 func makeProvider(source, namespace string) (metrics.Provider, error) {
 	switch source {
 	case "mock":
-		return metrics.NewMockProvider(), nil
+		return metrics.NewMockProvider("mock-cluster"), nil
 	case "k8s":
 		return metrics.NewK8sProvider(namespace, "")
 	default:

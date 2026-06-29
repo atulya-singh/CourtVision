@@ -114,7 +114,7 @@ AI-powered analysis.`,
 			var provider metrics.Provider
 			switch metricsStr {
 			case "mock":
-				provider = metrics.NewMockProvider()
+				provider = metrics.NewMockProvider("mock-cluster")
 			case "k8s":
 				p, err := metrics.NewK8sProvider(namespace, "")
 				if err != nil {

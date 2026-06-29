@@ -90,7 +90,7 @@ with SSE for real-time updates.`,
 			switch metricsStr {
 			case "mock":
 				styledLog("Using %s metrics provider", ui.CyanStyle.Render("mock"))
-				provider = metrics.NewMockProvider()
+				provider = metrics.NewMockProvider("mock-cluster")
 			case "k8s":
 				styledLog("Using %s metrics provider", ui.CyanStyle.Render("Kubernetes"))
 				var err error

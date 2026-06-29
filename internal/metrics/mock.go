@@ -15,10 +15,11 @@ type Provider interface {
 }
 
 type MockProvider struct {
-	mu    sync.Mutex
-	tick  int
-	nodes []nodeTemplate
-	pods  []podTemplate
+	mu          sync.Mutex
+	tick        int
+	clusterName string
+	nodes       []nodeTemplate
+	pods        []podTemplate
 }
 
 type nodeTemplate struct {
@@ -41,7 +42,10 @@ type podTemplate struct {
 	noisy     bool // will this pode spike ?
 }
 
-func NewMockProvider() *MockProvider {
+// NewMockProvider builds a simulated single-cluster provider. clusterName is
+// stamped onto every snapshot so multiple mock providers can stand in for
+// distinct clusters in a multi-cluster setup.
+func NewMockProvider(clusterName string) *MockProvider {
 	nodes := []nodeTemplate{
 		{"node-general-1", "general", 4000, 8192},
 		{"node-general-2", "general", 4000, 8192},
@@ -65,7 +69,7 @@ func NewMockProvider() *MockProvider {
 		{"postgres-primary-6a1c", "databases", "node-memory-1", 400, 4096, 800, 400, 8192, 4096, false},
 	}
 
-	return &MockProvider{nodes: nodes, pods: pods}
+	return &MockProvider{clusterName: clusterName, nodes: nodes, pods: pods}
 }
 
 func (m *MockProvider) GetClusterSnapshot() (*types.ClusterSnapshot, error) {
@@ -75,7 +79,7 @@ func (m *MockProvider) GetClusterSnapshot() (*types.ClusterSnapshot, error) {
 	m.mu.Unlock()
 
 	now := time.Now()
-	snapshot := &types.ClusterSnapshot{Timestamp: now}
+	snapshot := &types.ClusterSnapshot{ClusterName: m.clusterName, Timestamp: now}
 
 	nodeUsage := make(map[string][2]float64) //node -> [cpuUsed, memUsed]
 
