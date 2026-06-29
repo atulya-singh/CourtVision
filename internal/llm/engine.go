@@ -41,7 +41,13 @@ func (e *Engine) Analyze(snapshot *types.ClusterSnapshot) ([]types.Decision, err
 		return nil, err
 	}
 
-	log.Printf("LLM produced %d decision(s)", len(decisions))
+	// Stamp the originating cluster onto every decision so the store, API, and
+	// coordinator can attribute it to the right cluster in a multi-cluster setup.
+	for i := range decisions {
+		decisions[i].ClusterName = snapshot.ClusterName
+	}
+
+	log.Printf("LLM produced %d decision(s) for cluster %q", len(decisions), snapshot.ClusterName)
 
 	return decisions, nil
 }

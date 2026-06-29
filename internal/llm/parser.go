@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/atulya-singh/CourtVision/internal/types"
@@ -23,7 +24,10 @@ type llmDecision struct {
 	NewMemLimit float64 `json:"new_mem_limit,omitempty"`
 }
 
-var parseCount int // tracks number of decisions we have parsed
+// parseCount tracks the number of decisions we have parsed. It is accessed
+// atomically so concurrent ClusterWorkers can parse responses safely without a
+// data race, and so decision IDs stay globally unique across all workers.
+var parseCount int64
 
 func ParseResponse(raw string) ([]types.Decision, error) {
 	var decisions []types.Decision
@@ -76,7 +80,7 @@ func cleanLLMOutput(raw string) string {
 
 // convertToDecision maps the LLM's JSON format to our internal Decision type
 func convertToDecision(ld llmDecision) types.Decision {
-	parseCount++
+	count := atomic.AddInt64(&parseCount, 1)
 
 	// Map string action to our ActionType
 	action := types.ActionNone
@@ -105,7 +109,7 @@ func convertToDecision(ld llmDecision) types.Decision {
 	}
 
 	return types.Decision{
-		ID:          fmt.Sprintf("llm-decision-%d-%d", time.Now().Unix(), parseCount),
+		ID:          fmt.Sprintf("llm-decision-%d-%d", time.Now().Unix(), count),
 		Timestamp:   time.Now(),
 		Severity:    severity,
 		Action:      action,
