@@ -24,47 +24,7 @@ You understand resource contention, noisy neighbor problems, node affinity, and 
 
 	// Part 2: Cluster data
 	b.WriteString("=== CURRENT CLUSTER STATE ===\n\n")
-
-	// Nodes first — gives the LLM context about available capacity
-	b.WriteString("NODES:\n")
-	for _, n := range snapshot.Nodes {
-		cpuPressure := n.CPUPressure() * 100
-		memPressure := 0.0
-		if n.MemCapacityMb > 0 {
-			memPressure = (n.MemUsedMB / n.MemCapacityMb) * 100
-		}
-		fmt.Fprintf(&b, "  %s [type=%s] CPU: %.0f/%.0fm (%.0f%%) | Mem: %.0f/%.0fMB (%.0f%%) | Pods: %d\n",
-			n.NodeName, n.NodeType,
-			n.CPUUsedMilli, n.CPUCapacityMilli, cpuPressure,
-			n.MemUsedMB, n.MemCapacityMb, memPressure,
-			n.PodCount,
-		)
-	}
-
-	// Pods — the detailed per-pod metrics
-	b.WriteString("\nPODS:\n")
-	for _, p := range snapshot.Pods {
-		cpuPct := p.CPUPercent()
-		memPct := p.MemPercent()
-
-		// Flag pods that look problematic
-		flag := ""
-		if cpuPct > 90 || memPct > 85 {
-			flag = " ⚠️ ATTENTION"
-		}
-		if cpuPct > 130 || p.RestartCount > 3 {
-			flag = " 🚨 CRITICAL"
-		}
-
-		fmt.Fprintf(&b, "  %s (ns=%s, node=%s)%s\n", p.PodName, p.Namespace, p.NodeName, flag)
-		fmt.Fprintf(&b, "    CPU: %.0fm used / %.0fm limit / %.0fm request (%.0f%% of limit)\n",
-			p.CPUUsageMilli, p.CPULimitMilli, p.CPURequestMilli, cpuPct)
-		fmt.Fprintf(&b, "    Mem: %.0fMB used / %.0fMB limit / %.0fMB request (%.0f%% of limit)\n",
-			p.MemUsageMB, p.MemLimitMB, p.MemRequestMB, memPct)
-		if p.RestartCount > 0 {
-			fmt.Fprintf(&b, "    Restarts: %d\n", p.RestartCount)
-		}
-	}
+	writeClusterMetrics(&b, snapshot)
 
 	// Part 3: Output instructions
 	b.WriteString(`
@@ -87,6 +47,97 @@ RULES:
 - Be specific in reasoning — mention actual numbers
 - For patch_limits, set new limits to 130% of current usage (30% headroom)
 - For evict_and_move, pick the node with the lowest CPU pressure that has enough capacity
+- Output ONLY valid JSON lines, nothing else — no markdown, no explanation, no code blocks
+`)
+
+	return b.String()
+}
+
+// writeClusterMetrics renders one cluster's nodes and pods in the readable
+// format the LLM expects. It is shared by the single-cluster and multi-cluster
+// prompts so both present metrics identically.
+func writeClusterMetrics(b *strings.Builder, snapshot *types.ClusterSnapshot) {
+	// Nodes first — gives the LLM context about available capacity
+	b.WriteString("NODES:\n")
+	for _, n := range snapshot.Nodes {
+		cpuPressure := n.CPUPressure() * 100
+		memPressure := 0.0
+		if n.MemCapacityMb > 0 {
+			memPressure = (n.MemUsedMB / n.MemCapacityMb) * 100
+		}
+		fmt.Fprintf(b, "  %s [type=%s] CPU: %.0f/%.0fm (%.0f%%) | Mem: %.0f/%.0fMB (%.0f%%) | Pods: %d\n",
+			n.NodeName, n.NodeType,
+			n.CPUUsedMilli, n.CPUCapacityMilli, cpuPressure,
+			n.MemUsedMB, n.MemCapacityMb, memPressure,
+			n.PodCount,
+		)
+	}
+
+	// Pods — the detailed per-pod metrics
+	b.WriteString("\nPODS:\n")
+	for _, p := range snapshot.Pods {
+		cpuPct := p.CPUPercent()
+		memPct := p.MemPercent()
+
+		// Flag pods that look problematic
+		flag := ""
+		if cpuPct > 90 || memPct > 85 {
+			flag = " ⚠️ ATTENTION"
+		}
+		if cpuPct > 130 || p.RestartCount > 3 {
+			flag = " 🚨 CRITICAL"
+		}
+
+		fmt.Fprintf(b, "  %s (ns=%s, node=%s)%s\n", p.PodName, p.Namespace, p.NodeName, flag)
+		fmt.Fprintf(b, "    CPU: %.0fm used / %.0fm limit / %.0fm request (%.0f%% of limit)\n",
+			p.CPUUsageMilli, p.CPULimitMilli, p.CPURequestMilli, cpuPct)
+		fmt.Fprintf(b, "    Mem: %.0fMB used / %.0fMB limit / %.0fMB request (%.0f%% of limit)\n",
+			p.MemUsageMB, p.MemLimitMB, p.MemRequestMB, memPct)
+		if p.RestartCount > 0 {
+			fmt.Fprintf(b, "    Restarts: %d\n", p.RestartCount)
+		}
+	}
+}
+
+// BuildMultiClusterPrompt creates the prompt the master coordinator sends to the
+// LLM. It lays out every cluster's state in its own labeled section and asks the
+// LLM to reason about tradeoffs that no single cluster's agent could see — for
+// example, relieving an overloaded cluster by shifting work to one with spare
+// capacity. Cross-cluster decisions must name the cluster they apply to via the
+// "target_cluster" field so the coordinator can route them to the right worker.
+func BuildMultiClusterPrompt(snapshots []*types.ClusterSnapshot) string {
+	var b strings.Builder
+
+	b.WriteString(`You are an expert multi-cluster Kubernetes coordinator. You oversee several independent clusters, each already watched by its own agent. Your job is to spot problems that only become visible when looking across clusters at once.
+
+Focus on cross-cluster tradeoffs: one cluster under heavy pressure while another has spare capacity, workloads that would be healthier if relocated, or fleet-wide capacity risks. Do NOT repeat the per-cluster fixes the local agents already handle. You make conservative decisions — only act when there's a clear cross-cluster opportunity.
+
+`)
+
+	b.WriteString("=== FLEET STATE ===\n\n")
+	for _, snapshot := range snapshots {
+		fmt.Fprintf(&b, "--- CLUSTER: %s ---\n", snapshot.ClusterName)
+		writeClusterMetrics(&b, snapshot)
+		b.WriteString("\n")
+	}
+
+	b.WriteString(`=== YOUR TASK ===
+
+Analyze the fleet state above. For each cross-cluster action you recommend, output a JSON object on its own line.
+
+AVAILABLE ACTIONS:
+- "evict_and_move": Relocate a pod (use when its cluster is under heavy pressure and another cluster has capacity)
+- "scale_down": Reduce replicas in an over-provisioned cluster
+- "none": Monitor only (use when the fleet is balanced or problems are best left to the local agents)
+
+OUTPUT FORMAT — one JSON object per line, no other text:
+{"action":"<action>","target_cluster":"<cluster_name>","target_pod":"<pod_name>","namespace":"<namespace>","severity":"<low|medium|high|critical>","reasoning":"<1-2 sentence explanation>","target_node":"<node_name if evict_and_move>"}
+
+RULES:
+- Always set "target_cluster" to the cluster the action applies to
+- Only recommend an action when the cross-cluster picture clearly justifies it
+- If the fleet is balanced, output exactly: {"action":"none","reasoning":"Fleet is balanced; no cross-cluster action needed"}
+- Be specific in reasoning — compare actual numbers across clusters
 - Output ONLY valid JSON lines, nothing else — no markdown, no explanation, no code blocks
 `)
 

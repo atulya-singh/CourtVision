@@ -14,14 +14,15 @@ import (
 // It maps to our types.Decision but with simpler field names for the LLM.
 
 type llmDecision struct {
-	Action      string  `json:"action"`
-	TargetPod   string  `json:"target_pod"`
-	Namespace   string  `json:"namespace"`
-	Severity    string  `json:"severity"`
-	Reasoning   string  `json:"reasoning"`
-	TargetNode  string  `json:"target_node,omitempty"`
-	NewCPULimit float64 `json:"new_cpu_limit,omitempty"`
-	NewMemLimit float64 `json:"new_mem_limit,omitempty"`
+	Action        string  `json:"action"`
+	TargetCluster string  `json:"target_cluster,omitempty"`
+	TargetPod     string  `json:"target_pod"`
+	Namespace     string  `json:"namespace"`
+	Severity      string  `json:"severity"`
+	Reasoning     string  `json:"reasoning"`
+	TargetNode    string  `json:"target_node,omitempty"`
+	NewCPULimit   float64 `json:"new_cpu_limit,omitempty"`
+	NewMemLimit   float64 `json:"new_mem_limit,omitempty"`
 }
 
 // parseCount tracks the number of decisions we have parsed. It is accessed
@@ -119,6 +120,10 @@ func convertToDecision(ld llmDecision) types.Decision {
 		Reasoning:   ld.Reasoning,
 		NewCPULimit: ld.NewCPULimit,
 		NewMemLimit: ld.NewMemLimit,
+		// Set from the LLM for cross-cluster (coordinator) decisions. The
+		// single-cluster Engine overwrites this with the snapshot's cluster
+		// after parsing, so per-cluster decisions are unaffected.
+		ClusterName: ld.TargetCluster,
 		Executed:    false,
 	}
 }
