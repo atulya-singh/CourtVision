@@ -2,6 +2,8 @@
 
 An autonomous Kubernetes controller that uses a local LLM to analyze real-time cluster metrics and make intelligent infrastructure decisions. Instead of blindly restarting failing pods, CourtVision reasons about resource contention, noisy neighbor problems, and capacity constraints — then recommends whether to adjust resource limits, migrate pods to different nodes, or scale deployments.
 
+CourtVision runs in two shapes. **Single-cluster mode** watches one cluster with one agent. **Multi-agent mode** runs one subagent per cluster, each monitoring its own cluster in parallel, plus a master coordinator that reasons across the whole fleet — spotting cross-cluster opportunities like relieving an overloaded cluster by shifting work to one with spare capacity.
+
 ## Performance
 
 Benchmarks run on Apple M-series (Go 1.22, `go test -bench=. -benchmem`):
@@ -37,9 +39,38 @@ The LLM doesn't just detect problems — it explains its reasoning in natural la
 - **scale_down** — reduce replicas when a deployment is over-provisioned
 - **none** — continue monitoring when metrics are elevated but not dangerous
 
+### Multi-Agent Mode
+
+For fleets with more than one cluster, `courtvision multi-monitor` runs a two-tier topology:
+
+```
+                         ┌──────────────────────────┐
+                         │   Coordinator (master)   │   slow loop (~30s)
+                         │   reads cached snapshots  │   cross-cluster reasoning
+                         │   → fleet-wide decisions  │   → /api/decisions
+                         └────────────┬─────────────┘
+              reads LatestSnapshot()  │  (never touches clusters directly)
+            ┌────────────────────────┼────────────────────────┐
+            ▼                        ▼                         ▼
+   ┌─────────────────┐     ┌─────────────────┐      ┌─────────────────┐
+   │ ClusterWorker   │     │ ClusterWorker   │      │ ClusterWorker   │  fast loop (~5s)
+   │   prod-us       │     │   prod-eu       │      │   staging       │  collect→analyze→store
+   │ own store+exec  │     │ own store+exec  │      │ own store+exec  │  /api/clusters/{name}/…
+   └────────┬────────┘     └────────┬────────┘      └────────┬────────┘
+            ▼                        ▼                         ▼
+        cluster A                cluster B                 cluster C
+```
+
+- **Subagents (`ClusterWorker`)** — one per cluster, each running the full collect → analyze → store pipeline on its own fast loop. Each owns its own decision store and an executor bound to that cluster's kubeconfig context, so approvals always land on the right cluster.
+- **Master agent (`Coordinator`)** — runs a deliberately slower loop. It reads each worker's *cached* snapshot (it never collects from clusters itself), asks the LLM to reason about the fleet as a whole, and records cross-cluster decisions in its own store. It only runs once at least two clusters have reported, so cold start and single-cluster cases stay quiet.
+- **Approval routing** — coordinator decisions carry a `target_cluster`; when an operator approves one, it executes against the cluster it targets, not a global executor.
+
+The two loops are independently tunable (`--interval` for workers, `--coordinator-interval` for the master). The master is meant to run several times slower than the workers — it reads cached state, so running it faster buys nothing, and cross-cluster moves are strategic decisions that shouldn't be re-litigated every few seconds.
+
 ## Features
 
 - **Real Kubernetes integration** — connects to any cluster via kubeconfig (AWS EKS, GKE, AKS, Minikube, Kind)
+- **Multi-cluster, multi-agent** — one subagent per cluster plus a master coordinator for cross-cluster reasoning, all in a single process
 - **Local LLM analysis** — uses Ollama with Llama 3 for on-device inference, no data leaves your machine
 - **Interactive CLI** — styled terminal interface with REPL mode, colored output, and spinners
 - **Real-time dashboard** — React frontend with glassmorphism UI, live metric visualization, and SSE-powered decision feed
@@ -123,6 +154,21 @@ courtvision monitor --metrics k8s --namespace production --port 8080
 
 # Run with mock data (no cluster needed)
 courtvision monitor --metrics mock --port 8080
+
+# Multi-agent mode — one subagent per cluster + a cross-cluster coordinator
+courtvision multi-monitor --clusters prod-us,prod-eu,staging --metrics k8s --interval 5s
+
+# Multi-agent mode with mock data (two simulated clusters, no cluster or LLM needed)
+courtvision multi-monitor --clusters mock-a,mock-b --metrics mock
+```
+
+In multi-agent mode the API exposes per-cluster state and the coordinator's fleet-wide decisions:
+
+```bash
+curl localhost:8080/api/clusters                       # fleet roll-up (pods/nodes/decisions per cluster)
+curl localhost:8080/api/clusters/prod-us/snapshot      # one cluster's latest snapshot
+curl localhost:8080/api/clusters/prod-us/decisions     # one cluster's decisions
+curl localhost:8080/api/decisions                       # coordinator's cross-cluster decisions
 ```
 
 ### Dashboard
@@ -153,6 +199,22 @@ Start the continuous monitoring agent with API server.
 | `--interval` | `3s` | Monitoring loop interval |
 | `--dry-run` | `true` | Log decisions without executing |
 
+### `courtvision multi-monitor`
+
+Monitor multiple clusters with one subagent each plus a cross-cluster coordinator.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--clusters` | (required) | Comma-separated kubeconfig context names to monitor |
+| `--metrics` | `mock` | Metrics source: `mock` or `k8s` |
+| `--namespace` | `` (all) | Kubernetes namespace to watch (applies to every cluster) |
+| `--port` | `8080` | API server port |
+| `--ollama-url` | `http://localhost:11434` | Ollama server URL |
+| `--model` | `llama3` | LLM model name |
+| `--interval` | `5s` | Per-cluster worker loop interval |
+| `--coordinator-interval` | `30s` | Coordinator (cross-cluster) loop interval |
+| `--dry-run` | `true` | Log decisions without executing |
+
 ### `courtvision analyze`
 
 Run a one-shot cluster analysis and exit.
@@ -179,25 +241,29 @@ Print version, commit hash, and build date.
 CourtVision/
 ├── cmd/courtvision/          ← CLI entry point (Cobra commands)
 │   ├── main.go               ← root command + REPL
-│   ├── monitor.go             ← continuous monitoring subcommand
+│   ├── monitor.go             ← continuous (single-cluster) monitoring subcommand
+│   ├── multi.go               ← multi-cluster monitoring subcommand (workers + coordinator)
 │   ├── analyze.go             ← one-shot analysis subcommand
 │   └── status.go              ← connectivity check subcommand
 ├── internal/
 │   ├── types/                 ← shared data structures (PodMetrics, Decision, etc.)
 │   ├── metrics/
 │   │   ├── mock.go            ← simulated cluster with noisy neighbor
-│   │   └── k8s.go             ← real Kubernetes metrics via client-go
+│   │   └── k8s.go             ← real Kubernetes metrics via client-go (kubeconfig context aware)
 │   ├── llm/
 │   │   ├── client.go          ← Ollama HTTP client
 │   │   ├── engine.go          ← LLM decision engine (implements Engine interface)
-│   │   ├── prompt.go          ← cluster snapshot → structured LLM prompt
+│   │   ├── prompt.go          ← cluster snapshot → structured LLM prompt (+ cross-cluster prompt)
 │   │   └── parser.go          ← LLM text output → structured decisions
 │   ├── decision/
 │   │   └── engine.go          ← rule-based fallback engine
+│   ├── cluster/
+│   │   ├── worker.go          ← ClusterWorker: per-cluster subagent pipeline
+│   │   └── coordinator.go     ← Coordinator: master agent for cross-cluster reasoning
 │   ├── store/
 │   │   └── store.go           ← thread-safe shared state with SSE pub/sub
 │   ├── api/
-│   │   └── server.go          ← REST API + SSE streaming endpoints
+│   │   └── server.go          ← REST API + SSE endpoints (single- and multi-cluster routes)
 │   └── ui/
 │       └── styles.go          ← terminal styling (lipgloss colors, layouts)
 └── web/                       ← React dashboard (Vite + TypeScript + Tailwind)
@@ -205,15 +271,19 @@ CourtVision/
 
 ### Data Flow
 
-1. **Metrics Provider** (`mock.go` or `k8s.go`) collects a cluster snapshot every N seconds
+1. **Metrics Provider** (`mock.go` or `k8s.go`) collects a cluster snapshot every N seconds, stamped with the cluster's name
 2. **LLM Engine** converts the snapshot to a prompt, sends it to Ollama, parses the response into structured decisions
 3. **Store** saves the snapshot and decisions, notifies SSE subscribers
 4. **API Server** serves cluster state via REST and streams decisions via SSE
 5. **Dashboard** (React) renders the cluster visually and shows the decision feed in real-time
 
+In multi-agent mode this pipeline runs once per cluster inside a `ClusterWorker`, each with its own store and executor. A `Coordinator` sits on top: it periodically reads every worker's cached snapshot, builds a single cross-cluster prompt, and records fleet-wide decisions in its own store. Because cluster identity flows through `ClusterSnapshot` and `Decision`, decisions are always attributable to the cluster they belong to, and approvals route to the correct cluster's executor.
+
 ### Key Design Pattern
 
 Every major component is behind an interface — `metrics.Provider`, `decision.Engine`, `llm.Generatable`. This means you can swap implementations without changing any other code. Mock metrics → real Kubernetes. Rule engine → LLM engine. Local Ollama → remote API. One line change in the wiring, zero changes elsewhere.
+
+This is exactly what makes multi-agent mode cheap: a `ClusterWorker` is just the single-cluster pipeline behind those same interfaces, parameterized by a kubeconfig context. Spinning up N clusters is N instances of the same wiring, and the `Coordinator` composes them without any of them knowing it exists.
 
 ## Tech Stack
 
@@ -227,9 +297,16 @@ Every major component is behind an interface — `metrics.Provider`, `decision.E
 
 ## Roadmap
 
+Recently shipped:
+
+- [x] **Multi-cluster, multi-agent mode** — `multi-monitor` runs one subagent per cluster plus a cross-cluster coordinator (see [Multi-Agent Mode](#multi-agent-mode)).
+
 Things still on the list, roughly in priority order:
 
-- [ ] **Non-blocking LLM analysis** — the monitor loop currently blocks while Ollama thinks, stalling the whole cycle when the model is slow or down. Add a timeout and run analysis asynchronously.
+- [ ] **Non-blocking LLM analysis** — the monitor and coordinator loops currently block while Ollama thinks, stalling the cycle when the model is slow or down. Add a timeout and run analysis asynchronously.
+- [ ] **Tests for the `cluster` package** — `ClusterWorker` and `Coordinator` have no tests yet; a race test on the worker's snapshot publish/read and a coordinator test with a stub LLM are the obvious first additions.
+- [ ] **Per-cluster dashboard** — the React dashboard still targets the single-cluster `/api/*` routes and is not yet aware of `/api/clusters/{cluster}/...` or the coordinator's fleet view.
+- [ ] **Per-cluster overrides in multi-monitor** — `--namespace` and `--dry-run` apply uniformly to every cluster; a config file would let heterogeneous clusters differ.
 - [ ] **Persistent audit log** — decisions and executions live only in an in-memory ring buffer. Anything that mutates a real cluster needs a durable, on-disk record of what changed and why.
 - [ ] **Multi-container `patch_limits`** — currently only the first container in a pod gets patched.
 - [ ] **Honor `target_node` in `evict_and_move`** — eviction is best-effort and does not yet pin the pod to the chosen node.
