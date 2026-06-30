@@ -29,6 +29,7 @@ to different nodes, or scale deployments.`,
 	}
 
 	rootCmd.AddCommand(monitorCmd())
+	rootCmd.AddCommand(multiMonitorCmd())
 	rootCmd.AddCommand(analyzeCmd())
 	rootCmd.AddCommand(statusCmd())
 	rootCmd.AddCommand(versionCmd())
