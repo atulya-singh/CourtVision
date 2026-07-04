@@ -300,10 +300,9 @@ This is exactly what makes multi-agent mode cheap: a `ClusterWorker` is just the
 Recently shipped:
 
 - [x] **Multi-cluster, multi-agent mode** — `multi-monitor` runs one subagent per cluster plus a cross-cluster coordinator (see [Multi-Agent Mode](#multi-agent-mode)).
+- [x] **Non-blocking LLM analysis** — collection and analysis now run on separate goroutines. Each loop keeps collecting and publishing fresh snapshots on its interval while LLM analysis runs asynchronously against the latest snapshot (drop-latest hand-off), so a slow or down Ollama never stalls the cycle. The coordinator skips a tick if its previous analysis is still running instead of piling up.
 
 Things still on the list, roughly in priority order:
-
-- [ ] **Non-blocking LLM analysis** — the monitor and coordinator loops currently block while Ollama thinks, stalling the cycle when the model is slow or down. Add a timeout and run analysis asynchronously.
 - [ ] **Tests for the `cluster` package** — `ClusterWorker` and `Coordinator` have no tests yet; a race test on the worker's snapshot publish/read and a coordinator test with a stub LLM are the obvious first additions.
 - [ ] **Per-cluster dashboard** — the React dashboard still targets the single-cluster `/api/*` routes and is not yet aware of `/api/clusters/{cluster}/...` or the coordinator's fleet view.
 - [ ] **Per-cluster overrides in multi-monitor** — `--namespace` and `--dry-run` apply uniformly to every cluster; a config file would let heterogeneous clusters differ.

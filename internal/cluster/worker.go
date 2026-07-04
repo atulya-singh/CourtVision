@@ -45,10 +45,26 @@ func NewClusterWorker(name string, provider metrics.Provider, engine decision.En
 	}
 }
 
-// Run drives the worker's monitoring loop until ctx is cancelled. It mirrors the
-// single-cluster monitor loop: collect a snapshot, analyze it, and record the
-// resulting decisions, while also publishing the snapshot for the Coordinator.
+// Run drives the worker's monitoring loop until ctx is cancelled. Metrics
+// collection is fast but LLM analysis can take many seconds, so the two run on
+// separate goroutines: the collection loop below ticks on interval, publishing a
+// fresh snapshot each time, while analyze() consumes those snapshots on its own
+// schedule. A slow (or hung) Ollama call therefore never stalls collection, and
+// the Coordinator and dashboard always see up-to-date cluster state.
 func (w *ClusterWorker) Run(ctx context.Context, interval time.Duration) {
+	// analyzeCh hands the freshest snapshot to the analysis goroutine. It holds a
+	// single slot with drop-latest semantics (see offerLatest): if the analyzer is
+	// still busy with a previous snapshot, the waiting one is replaced rather than
+	// queued, so we never build a backlog of stale work.
+	analyzeCh := make(chan *types.ClusterSnapshot, 1)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		w.analyze(ctx, analyzeCh)
+	}()
+
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
@@ -58,6 +74,9 @@ func (w *ClusterWorker) Run(ctx context.Context, interval time.Duration) {
 		select {
 		case <-ctx.Done():
 			log.Printf("[%s] worker stopped", w.name)
+			// Wait for the analyzer to observe cancellation and exit so we don't
+			// leak a goroutine per worker on shutdown.
+			wg.Wait()
 			return
 		case <-ticker.C:
 			snapshot, err := w.provider.GetClusterSnapshot()
@@ -74,22 +93,29 @@ func (w *ClusterWorker) Run(ctx context.Context, interval time.Duration) {
 			w.latest = snapshot
 			w.mu.Unlock()
 
+			// Hand the snapshot off for analysis without blocking. If the analyzer
+			// is still working, this replaces the pending snapshot so it always
+			// picks up the freshest data next.
+			offerLatest(analyzeCh, snapshot)
+		}
+	}
+}
+
+// analyze consumes snapshots and runs the (potentially slow) decision engine on
+// them, recording any resulting decisions. It runs on its own goroutine so that a
+// slow LLM call never blocks the collection loop in Run.
+func (w *ClusterWorker) analyze(ctx context.Context, ch <-chan *types.ClusterSnapshot) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case snapshot := <-ch:
 			decisions, err := w.engine.Analyze(snapshot)
 			if err != nil {
 				log.Printf("[%s] ERROR analyzing: %v", w.name, err)
 				continue
 			}
-
-			for _, d := range decisions {
-				// Decisions that propose a real action wait for human approval;
-				// informational ones (action == none) have nothing to approve.
-				if d.Action == types.ActionNone {
-					d.Status = types.StatusNone
-				} else {
-					d.Status = types.StatusPending
-				}
-				w.store.AddDecision(d)
-			}
+			recordDecisions(w.store, decisions)
 		}
 	}
 }

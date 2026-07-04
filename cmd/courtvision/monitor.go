@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -139,15 +140,63 @@ with SSE for real-time updates.`,
 	return cmd
 }
 
+// styledMonitorLoop collects metrics on interval and hands each snapshot to a
+// separate analysis goroutine. Collection is fast, but LLM analysis can take many
+// seconds (or stall on a slow Ollama), so running the two on one goroutine would
+// let a slow model freeze metrics collection and leave the dashboard's snapshot
+// stale. Instead the collection loop keeps ticking and publishing fresh snapshots
+// while analysis runs asynchronously against the latest one.
 func styledMonitorLoop(ctx context.Context, provider metrics.Provider, engine decision.Engine, st *store.Store, interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
 	styledLog := func(format string, args ...interface{}) {
 		ts := ui.DimStyle.Render(time.Now().Format("15:04:05"))
 		msg := fmt.Sprintf(format, args...)
 		fmt.Printf("  %s  %s\n", ts, msg)
 	}
+
+	// analyzeCh is a single-slot, drop-latest hand-off: if analysis is still busy
+	// when a fresh snapshot arrives, the waiting one is replaced so we never queue
+	// stale work behind a slow LLM call.
+	analyzeCh := make(chan *types.ClusterSnapshot, 1)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case snapshot := <-analyzeCh:
+				decisions, err := engine.Analyze(snapshot)
+				if err != nil {
+					styledLog("%s analyzing: %v", ui.RedStyle.Render("ERROR"), err)
+					continue
+				}
+
+				for _, d := range decisions {
+					// Decisions that propose a real action wait for human approval;
+					// informational ones (action == none) have nothing to approve.
+					if d.Action == types.ActionNone {
+						d.Status = types.StatusNone
+					} else {
+						d.Status = types.StatusPending
+					}
+					st.AddDecision(d)
+					styledLog("Decision: %s %s → %s",
+						ui.SeverityBadge(string(d.Severity)),
+						ui.CyanStyle.Render(d.TargetPod),
+						ui.BlueStyle.Render(string(d.Action)))
+				}
+
+				if len(decisions) == 0 {
+					styledLog("%s Cycle complete — no issues", ui.CheckMark)
+				}
+			}
+		}
+	}()
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
 
 	styledLog("Monitor loop started")
 
@@ -155,6 +204,7 @@ func styledMonitorLoop(ctx context.Context, provider metrics.Provider, engine de
 		select {
 		case <-ctx.Done():
 			styledLog("Monitor loop stopped")
+			wg.Wait()
 			return
 		case <-ticker.C:
 			snapshot, err := provider.GetClusterSnapshot()
@@ -165,29 +215,19 @@ func styledMonitorLoop(ctx context.Context, provider metrics.Provider, engine de
 
 			st.SetSnapshot(snapshot)
 
-			decisions, err := engine.Analyze(snapshot)
-			if err != nil {
-				styledLog("%s analyzing: %v", ui.RedStyle.Render("ERROR"), err)
-				continue
-			}
-
-			for _, d := range decisions {
-				// Decisions that propose a real action wait for human approval;
-				// informational ones (action == none) have nothing to approve.
-				if d.Action == types.ActionNone {
-					d.Status = types.StatusNone
-				} else {
-					d.Status = types.StatusPending
+			// Hand off to the analyzer without blocking. If it is still working,
+			// replace the pending snapshot with this fresher one (drop-latest).
+			select {
+			case analyzeCh <- snapshot:
+			default:
+				select {
+				case <-analyzeCh:
+				default:
 				}
-				st.AddDecision(d)
-				styledLog("Decision: %s %s → %s",
-					ui.SeverityBadge(string(d.Severity)),
-					ui.CyanStyle.Render(d.TargetPod),
-					ui.BlueStyle.Render(string(d.Action)))
-			}
-
-			if len(decisions) == 0 {
-				styledLog("%s Cycle complete — no issues", ui.CheckMark)
+				select {
+				case analyzeCh <- snapshot:
+				default:
+				}
 			}
 		}
 	}

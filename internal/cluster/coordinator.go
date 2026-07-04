@@ -3,6 +3,8 @@ package cluster
 import (
 	"context"
 	"log"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/atulya-singh/CourtVision/internal/llm"
@@ -21,6 +23,11 @@ type Coordinator struct {
 	llm      llm.Generatable
 	store    *store.Store
 	interval time.Duration
+
+	// busy is a single-flight guard: a tick that fires while a previous analysis
+	// is still running (slow LLM call) is skipped rather than queued, so ticks
+	// never pile up behind a slow Ollama.
+	busy atomic.Bool
 }
 
 // NewCoordinator builds the master agent over a set of workers. masterStore
@@ -48,13 +55,29 @@ func (c *Coordinator) Run(ctx context.Context) {
 
 	log.Printf("[coordinator] started (interval %s, %d workers)", c.interval, len(c.workers))
 
+	// wg tracks the in-flight tick goroutine so shutdown waits for it to finish.
+	var wg sync.WaitGroup
+
 	for {
 		select {
 		case <-ctx.Done():
 			log.Printf("[coordinator] stopped")
+			wg.Wait()
 			return
 		case <-ticker.C:
-			c.tick()
+			// Skip this tick if a previous analysis is still running — the LLM
+			// call can outlast the interval, and reasoning over even fresher
+			// snapshots next tick is better than a backlog.
+			if !c.busy.CompareAndSwap(false, true) {
+				log.Printf("[coordinator] previous analysis still running, skipping tick")
+				continue
+			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				defer c.busy.Store(false)
+				c.tick()
+			}()
 		}
 	}
 }
@@ -93,12 +116,5 @@ func (c *Coordinator) tick() {
 		return
 	}
 
-	for _, d := range decisions {
-		if d.Action == types.ActionNone {
-			d.Status = types.StatusNone
-		} else {
-			d.Status = types.StatusPending
-		}
-		c.store.AddDecision(d)
-	}
+	recordDecisions(c.store, decisions)
 }
