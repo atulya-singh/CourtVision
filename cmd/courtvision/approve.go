@@ -150,17 +150,10 @@ func renderDecisionPrompt(d types.Decision, position, total int) string {
 	return b.String()
 }
 
-// isReversible reports whether an action is safe to auto-execute: low blast
-// radius and undoable. cordon_node (uncordon), scale_down (scale back up) and
-// patch_limits (patch back) all qualify. evict_and_move deletes a pod and is not
-// cleanly reversible, so auto mode never runs it without explicit approval.
+// isReversible delegates to the canonical action classifier in the types
+// package, shared with the multi-cluster workers' auto-safe mode.
 func isReversible(a types.ActionType) bool {
-	switch a {
-	case types.ActionCordonNode, types.ActionScaleDown, types.ActionPatchLimits:
-		return true
-	default:
-		return false
-	}
+	return a.IsReversible()
 }
 
 func reviewHint(auto bool) string {

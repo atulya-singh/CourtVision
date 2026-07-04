@@ -32,6 +32,8 @@ func multiMonitorCmd() *cobra.Command {
 		interval      time.Duration
 		coordInterval time.Duration
 		dryRun        bool
+		autoSafe      bool
+		autoCooldown  time.Duration
 	)
 
 	cmd := &cobra.Command{
@@ -77,8 +79,21 @@ cross-cluster decisions under /api/decisions.`,
 				configLines = append(configLines, ui.ConfigLine("Mode:", ui.GreenStyle.Render("LIVE")))
 			}
 
+			if autoSafe {
+				configLines = append(configLines, ui.ConfigLine("Auto-safe:", ui.GreenStyle.Render("ON")+ui.DimStyle.Render(fmt.Sprintf(" (reversible actions, cooldown %s)", autoCooldown))))
+			} else {
+				configLines = append(configLines, ui.ConfigLine("Auto-safe:", ui.DimStyle.Render("off")))
+			}
+
 			fmt.Println(ui.ConfigBox.Render(strings.Join(configLines, "\n")))
 			fmt.Println()
+
+			// Auto-safe + LIVE means the agents mutate real clusters with no human
+			// in the loop — make that impossible to miss.
+			if autoSafe && !dryRun {
+				fmt.Println(ui.RedStyle.Render("  ⚠  auto-safe + LIVE: workers will autonomously execute reversible actions on real clusters"))
+				fmt.Println()
+			}
 
 			log.SetFlags(0)
 			log.SetPrefix("")
@@ -113,7 +128,7 @@ cross-cluster decisions under /api/decisions.`,
 					return fmt.Errorf("cluster %q: %w", name, err)
 				}
 
-				workers = append(workers, cluster.NewClusterWorker(name, provider, engine, exec))
+				workers = append(workers, cluster.NewClusterWorker(name, provider, engine, exec, autoSafe, autoCooldown))
 				styledLog("Worker ready for cluster %s", ui.CyanStyle.Render(name))
 			}
 
@@ -143,6 +158,8 @@ cross-cluster decisions under /api/decisions.`,
 	cmd.Flags().DurationVar(&interval, "interval", 5*time.Second, "Per-cluster worker loop interval")
 	cmd.Flags().DurationVar(&coordInterval, "coordinator-interval", 30*time.Second, "Coordinator (cross-cluster) loop interval")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", true, "Log decisions without executing them")
+	cmd.Flags().BoolVar(&autoSafe, "auto-safe", false, "Let each worker auto-execute its own reversible decisions (cordon_node, scale_down, patch_limits); evict_and_move still waits for approval")
+	cmd.Flags().DurationVar(&autoCooldown, "auto-cooldown", 3*time.Minute, "In auto-safe mode, suppress repeat auto-execution of the same action on the same target for this long")
 
 	return cmd
 }

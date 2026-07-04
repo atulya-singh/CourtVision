@@ -28,20 +28,34 @@ type ClusterWorker struct {
 	engine   decision.Engine
 	exec     executor.Executor
 
+	// auto-safe mode: when auto is set, the worker executes its own reversible
+	// decisions instead of leaving them pending. cooldown throttles repeat
+	// executions of the same action on the same target, and lastAuto records the
+	// last time each target was auto-executed. lastAuto is touched only from the
+	// single analyze goroutine, so it needs no lock.
+	auto     bool
+	cooldown time.Duration
+	lastAuto map[string]time.Time
+
 	mu     sync.RWMutex
 	latest *types.ClusterSnapshot
 }
 
 // NewClusterWorker assembles a worker from the per-cluster pieces. Each worker
 // owns its own store so per-cluster decisions never mix, and its own executor
-// so approved actions land on the right cluster.
-func NewClusterWorker(name string, provider metrics.Provider, engine decision.Engine, exec executor.Executor) *ClusterWorker {
+// so approved actions land on the right cluster. When auto is true the worker
+// auto-executes its reversible decisions (see autoExecute), throttled by
+// cooldown per target.
+func NewClusterWorker(name string, provider metrics.Provider, engine decision.Engine, exec executor.Executor, auto bool, cooldown time.Duration) *ClusterWorker {
 	return &ClusterWorker{
 		name:     name,
 		store:    store.New(),
 		provider: provider,
 		engine:   engine,
 		exec:     exec,
+		auto:     auto,
+		cooldown: cooldown,
+		lastAuto: make(map[string]time.Time),
 	}
 }
 
@@ -115,9 +129,86 @@ func (w *ClusterWorker) analyze(ctx context.Context, ch <-chan *types.ClusterSna
 				log.Printf("[%s] ERROR analyzing: %v", w.name, err)
 				continue
 			}
-			recordDecisions(w.store, decisions)
+			w.processDecisions(decisions)
 		}
 	}
+}
+
+// processDecisions records every decision (so the dashboard always sees it) and,
+// in auto-safe mode, carries out the worker's own reversible decisions.
+// Non-reversible ones (evict_and_move) always stay pending for explicit
+// approval, and repeats within the cooldown window are skipped.
+func (w *ClusterWorker) processDecisions(decisions []types.Decision) {
+	recordDecisions(w.store, decisions)
+	if !w.auto {
+		return
+	}
+	for _, d := range decisions {
+		if d.Action == types.ActionNone || !d.Action.IsReversible() {
+			continue
+		}
+		if w.onCooldown(d) {
+			log.Printf("[%s] auto-safe: %s on %s/%s still on cooldown, skipping", w.name, d.Action, d.Namespace, d.TargetPod)
+			continue
+		}
+		w.autoExecute(d)
+	}
+}
+
+// autoExecute runs a single reversible decision against the worker's own cluster
+// executor and records the outcome in the store, mirroring the API server's
+// executeDecision so the dashboard sees the same executing → executed/failed
+// lifecycle. It runs inline in the analyze goroutine, which is already decoupled
+// from metric collection, so a slow executor never stalls the collection loop.
+func (w *ClusterWorker) autoExecute(d types.Decision) {
+	w.markCooldown(d)
+
+	w.store.UpdateAndBroadcast(d.ID, func(x *types.Decision) {
+		x.Status = types.StatusExecuting
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	err := w.exec.Execute(ctx, &d)
+	now := time.Now()
+
+	w.store.UpdateAndBroadcast(d.ID, func(x *types.Decision) {
+		x.ExecutedAt = &now
+		if err != nil {
+			x.Status = types.StatusFailed
+			x.Executed = false
+			x.Error = err.Error()
+			return
+		}
+		x.Status = types.StatusExecuted
+		x.Executed = true
+		x.Error = ""
+	})
+
+	if err != nil {
+		log.Printf("[%s] auto-safe FAILED %s on %s/%s: %v", w.name, d.Action, d.Namespace, d.TargetPod, err)
+		return
+	}
+	log.Printf("[%s] auto-executed %s on %s/%s", w.name, d.Action, d.Namespace, d.TargetPod)
+}
+
+// cooldownKey identifies "the same action on the same target" so a problem that
+// recurs every tick is fixed at most once per cooldown window.
+func cooldownKey(d types.Decision) string {
+	target := d.Namespace + "/" + d.TargetPod
+	if d.Action == types.ActionCordonNode {
+		target = d.TargetNode
+	}
+	return string(d.Action) + "|" + target
+}
+
+func (w *ClusterWorker) onCooldown(d types.Decision) bool {
+	last, ok := w.lastAuto[cooldownKey(d)]
+	return ok && time.Since(last) < w.cooldown
+}
+
+func (w *ClusterWorker) markCooldown(d types.Decision) {
+	w.lastAuto[cooldownKey(d)] = time.Now()
 }
 
 // Name returns the worker's cluster name (its kubeconfig context).

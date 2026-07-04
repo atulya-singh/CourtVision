@@ -13,6 +13,21 @@ const (
 	ActionCordonNode   ActionType = "cordon_node"    // Mark node as unschedulable
 )
 
+// IsReversible reports whether an action is safe to auto-execute: low blast
+// radius and undoable. cordon_node (uncordon), scale_down (scale back up) and
+// patch_limits (patch back) all qualify. evict_and_move deletes a pod and is not
+// cleanly reversible, so auto modes never run it without explicit approval. This
+// is the single source of truth for the auto-accept / auto-safe gate, shared by
+// the interactive review flow and the multi-cluster workers.
+func (a ActionType) IsReversible() bool {
+	switch a {
+	case ActionCordonNode, ActionScaleDown, ActionPatchLimits:
+		return true
+	default:
+		return false
+	}
+}
+
 // Severity of the detected issue
 type Severity string
 
