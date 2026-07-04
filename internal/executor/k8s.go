@@ -71,28 +71,96 @@ func (e *K8sExecutor) Execute(ctx context.Context, d *types.Decision) error {
 // patchLimits raises the resource limits on the workload behind the target pod.
 // A running pod's limits cannot be edited in place, so we patch the owning
 // Deployment instead; Kubernetes then rolls out a new pod with the new limits.
+//
+// The decision carries a single pod-level target (NewCPULimit/NewMemLimit),
+// because the metrics that produced it were summed across every container in the
+// pod. We therefore distribute that target across all containers in proportion to
+// their current limits, rather than dumping the whole pod budget onto the first
+// container. Each resource is handled independently, and only when the decision
+// actually sets it.
 func (e *K8sExecutor) patchLimits(ctx context.Context, d *types.Decision) error {
 	dep, err := e.owningDeployment(ctx, d.Namespace, d.TargetPod)
 	if err != nil {
 		return err
 	}
-	if len(dep.Spec.Template.Spec.Containers) == 0 {
+	containers := dep.Spec.Template.Spec.Containers
+	if len(containers) == 0 {
 		return fmt.Errorf("deployment %s has no containers to patch", dep.Name)
 	}
 
-	c := &dep.Spec.Template.Spec.Containers[0]
-	if c.Resources.Limits == nil {
-		c.Resources.Limits = corev1.ResourceList{}
-	}
 	if d.NewCPULimit > 0 {
-		c.Resources.Limits[corev1.ResourceCPU] = *resource.NewMilliQuantity(int64(d.NewCPULimit), resource.DecimalSI)
+		current := make([]int64, len(containers))
+		for i := range containers {
+			current[i] = containers[i].Resources.Limits.Cpu().MilliValue()
+		}
+		shares := distribute(current, int64(d.NewCPULimit))
+		for i := range containers {
+			ensureLimits(&containers[i])
+			containers[i].Resources.Limits[corev1.ResourceCPU] = *resource.NewMilliQuantity(shares[i], resource.DecimalSI)
+		}
 	}
+
 	if d.NewMemLimit > 0 {
-		c.Resources.Limits[corev1.ResourceMemory] = *resource.NewQuantity(int64(d.NewMemLimit)*1024*1024, resource.BinarySI)
+		current := make([]int64, len(containers))
+		for i := range containers {
+			// Work in MB (not bytes) so total*current stays inside int64 range.
+			current[i] = containers[i].Resources.Limits.Memory().Value() / (1024 * 1024)
+		}
+		shares := distribute(current, int64(d.NewMemLimit))
+		for i := range containers {
+			ensureLimits(&containers[i])
+			containers[i].Resources.Limits[corev1.ResourceMemory] = *resource.NewQuantity(shares[i]*1024*1024, resource.BinarySI)
+		}
 	}
 
 	_, err = e.client.AppsV1().Deployments(dep.Namespace).Update(ctx, dep, metav1.UpdateOptions{})
 	return err
+}
+
+// ensureLimits makes sure a container has a non-nil Limits map before we write to
+// it — a container may have had no limits set at all.
+func ensureLimits(c *corev1.Container) {
+	if c.Resources.Limits == nil {
+		c.Resources.Limits = corev1.ResourceList{}
+	}
+}
+
+// distribute splits total across len(current) buckets in proportion to each
+// bucket's current value, returning integer shares that sum exactly to total.
+// When every current value is 0 (no container has a limit set), it splits total
+// evenly. Any remainder from integer division is given to the last bucket so the
+// shares always sum back to total, whether scaling up or down.
+//
+// Callers pass CPU in millicores and memory in MB (not bytes) so that
+// total*current[i] stays well within int64 range.
+func distribute(current []int64, total int64) []int64 {
+	out := make([]int64, len(current))
+	if len(current) == 0 {
+		return out
+	}
+
+	var sum int64
+	for _, c := range current {
+		sum += c
+	}
+
+	var allocated int64
+	if sum > 0 {
+		for i, c := range current {
+			out[i] = total * c / sum
+			allocated += out[i]
+		}
+	} else {
+		base := total / int64(len(current))
+		for i := range out {
+			out[i] = base
+			allocated += base
+		}
+	}
+
+	// Hand the rounding remainder to the last bucket so the shares sum to total.
+	out[len(out)-1] += total - allocated
+	return out
 }
 
 // scaleDown reduces the owning Deployment by one replica, never below one. The
