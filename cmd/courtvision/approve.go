@@ -150,8 +150,36 @@ func renderDecisionPrompt(d types.Decision, position, total int) string {
 	return b.String()
 }
 
-func reviewHint() string {
-	return ui.DimStyle.Render("  [a]pprove  [r]eject  [s]kip  [A]pprove all  [q]uit")
+// isReversible reports whether an action is safe to auto-execute: low blast
+// radius and undoable. cordon_node (uncordon), scale_down (scale back up) and
+// patch_limits (patch back) all qualify. evict_and_move deletes a pod and is not
+// cleanly reversible, so auto mode never runs it without explicit approval.
+func isReversible(a types.ActionType) bool {
+	switch a {
+	case types.ActionCordonNode, types.ActionScaleDown, types.ActionPatchLimits:
+		return true
+	default:
+		return false
+	}
+}
+
+func reviewHint(auto bool) string {
+	state := "off"
+	if auto {
+		state = ui.GreenStyle.Render("on")
+	}
+	return ui.DimStyle.Render("  [a]pprove  [r]eject  [s]kip  [A]pprove all  [tab] auto: ") +
+		state + ui.DimStyle.Render("  [q]uit")
+}
+
+// autoNotice explains, while auto mode is on, why the queue has paused on a
+// decision that auto mode will not run on its own. It returns an empty string
+// when there is nothing to flag (auto off, or the current action is reversible).
+func autoNotice(auto bool, d types.Decision) string {
+	if !auto || isReversible(d.Action) {
+		return ""
+	}
+	return ui.YellowStyle.Render(fmt.Sprintf("  auto on — %s needs explicit approval", d.Action))
 }
 
 // renderOutcome formats one finished decision for the running log.

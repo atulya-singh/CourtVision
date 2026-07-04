@@ -6,6 +6,24 @@ import (
 	"github.com/atulya-singh/CourtVision/internal/types"
 )
 
+func TestIsReversible(t *testing.T) {
+	tests := []struct {
+		action types.ActionType
+		want   bool
+	}{
+		{types.ActionCordonNode, true},
+		{types.ActionScaleDown, true},
+		{types.ActionPatchLimits, true},
+		{types.ActionEvictAndMove, false}, // deletes a pod — never auto-run
+		{types.ActionNone, false},
+	}
+	for _, tt := range tests {
+		if got := isReversible(tt.action); got != tt.want {
+			t.Errorf("isReversible(%q) = %v, want %v", tt.action, got, tt.want)
+		}
+	}
+}
+
 func TestNewReviewSession_FiltersNonActionable(t *testing.T) {
 	decisions := []types.Decision{
 		{ID: "1", Action: types.ActionPatchLimits},

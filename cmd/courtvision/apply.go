@@ -22,7 +22,21 @@ type applyModel struct {
 	log        []string
 	working    bool // an executor call is in flight
 	approveAll bool // operator chose "approve all remaining"
+	auto       bool // sticky auto-accept mode: auto-run reversible actions
 	quitting   bool
+}
+
+// autoAdvance kicks off the next decision automatically when auto mode is on and
+// the current action is reversible. It is called at every idle transition (after
+// a toggle, an execution, or a manual reject/skip) so auto mode walks the queue
+// on its own, pausing only on a non-reversible action that needs explicit
+// approval.
+func (m applyModel) autoAdvance() (applyModel, tea.Cmd) {
+	if m.auto && !m.working && !m.session.done() && isReversible(m.session.current().Action) {
+		m.working = true
+		return m, runExecutor(m.exec, m.session.current())
+	}
+	return m, nil
 }
 
 func newApplyModel(decisions []types.Decision, exec executor.Executor, label string) applyModel {
@@ -46,10 +60,11 @@ func (m applyModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.session.record(msg.status, errStr)
 		m.log = append(m.log, renderOutcome(m.session.outcomes[len(m.session.outcomes)-1]))
 		m.working = false
-		// A failure pauses "approve all" so the operator can react instead of
-		// firing the rest of the queue into a problem.
+		// A failure pauses "approve all" and auto mode so the operator can react
+		// instead of firing the rest of the queue into a problem.
 		if msg.status == types.StatusFailed {
 			m.approveAll = false
+			m.auto = false
 		}
 		if m.session.done() {
 			m.quitting = true
@@ -59,13 +74,18 @@ func (m applyModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.working = true
 			return m, runExecutor(m.exec, m.session.current())
 		}
-		return m, nil
+		return m.autoAdvance()
 
 	case tea.KeyMsg:
 		if m.working {
 			return m, nil // ignore input while an action is running
 		}
 		switch msg.String() {
+		case "tab":
+			// Toggle sticky auto-accept. Turning it on runs the next reversible
+			// action immediately; on a non-reversible one it just waits.
+			m.auto = !m.auto
+			return m.autoAdvance()
 		case "a", "y":
 			m.working = true
 			return m, runExecutor(m.exec, m.session.current())
@@ -80,7 +100,9 @@ func (m applyModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.quitting = true
 				return m, tea.Quit
 			}
-			return m, nil
+			// Resume auto mode on the next item if the operator cleared a
+			// non-reversible one that had paused the queue.
+			return m.autoAdvance()
 		case "s":
 			m.session.record(statusSkipped, "")
 			m.log = append(m.log, renderOutcome(m.session.outcomes[len(m.session.outcomes)-1]))
@@ -88,7 +110,7 @@ func (m applyModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.quitting = true
 				return m, tea.Quit
 			}
-			return m, nil
+			return m.autoAdvance()
 		case "q", "esc", "ctrl+c":
 			m.quitting = true
 			return m, tea.Quit
@@ -118,7 +140,10 @@ func (m applyModel) View() string {
 
 	b.WriteString(renderDecisionPrompt(m.session.current(), m.session.idx+1, m.session.total()))
 	b.WriteString("\n")
-	b.WriteString(reviewHint())
+	if notice := autoNotice(m.auto, m.session.current()); notice != "" {
+		b.WriteString(notice + "\n")
+	}
+	b.WriteString(reviewHint(m.auto))
 	b.WriteString("\n")
 	return b.String()
 }

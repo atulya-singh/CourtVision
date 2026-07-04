@@ -302,6 +302,7 @@ Recently shipped:
 - [x] **Multi-cluster, multi-agent mode** — `multi-monitor` runs one subagent per cluster plus a cross-cluster coordinator (see [Multi-Agent Mode](#multi-agent-mode)).
 - [x] **Non-blocking LLM analysis** — collection and analysis now run on separate goroutines. Each loop keeps collecting and publishing fresh snapshots on its interval while LLM analysis runs asynchronously against the latest snapshot (drop-latest hand-off), so a slow or down Ollama never stalls the cycle. The coordinator skips a tick if its previous analysis is still running instead of piling up.
 - [x] **Multi-container `patch_limits`** — a pod-level limit target is now distributed across *every* container in the pod in proportion to each container's current limit (the shares sum back to the target), instead of dumping the whole budget onto the first container and ignoring sidecars.
+- [x] **Interactive auto-accept mode** — in the review flow (`analyze --apply` and the REPL `review`), press **Tab** to toggle a sticky auto-accept mode. While on, it auto-runs *reversible* actions (`cordon_node`, `scale_down`, `patch_limits`) but pauses for explicit approval on `evict_and_move`, and turns itself off on the first failure. This is the `auto-safe` tier of graduated autonomy for the interactive surface.
 
 Things still on the list, roughly in priority order:
 - [ ] **Tests for the `cluster` package** — `ClusterWorker` and `Coordinator` have no tests yet; a race test on the worker's snapshot publish/read and a coordinator test with a stub LLM are the obvious first additions.
@@ -309,7 +310,7 @@ Things still on the list, roughly in priority order:
 - [ ] **Per-cluster overrides in multi-monitor** — `--namespace` and `--dry-run` apply uniformly to every cluster; a config file would let heterogeneous clusters differ.
 - [ ] **Persistent audit log** — decisions and executions live only in an in-memory ring buffer. Anything that mutates a real cluster needs a durable, on-disk record of what changed and why.
 - [ ] **Honor `target_node` in `evict_and_move`** — eviction is best-effort and does not yet pin the pod to the chosen node.
-- [ ] **Graduated autonomy levels** — the executor foundation supports it, but the tool is still hardwired to "ask first." Add an `auto-safe` mode that auto-runs only reversible actions, and a full-auto mode.
+- [ ] **Graduated autonomy levels (unattended)** — the interactive `auto-safe` toggle now exists (see above); still open is autonomy for the long-running `monitor`/`multi-monitor` (auto-execute streaming decisions) and a full-auto mode that also runs non-reversible actions.
 - [ ] **Document `review` and `analyze --apply`** — the new interactive approval flows in the REPL and CLI are not yet covered in the CLI Reference above.
 
 ## License

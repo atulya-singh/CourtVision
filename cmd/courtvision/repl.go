@@ -101,7 +101,20 @@ type replModel struct {
 	session   *reviewSession
 	exec      executor.Executor
 	reviewAll bool // operator chose "approve all remaining"
+	auto      bool // sticky auto-accept mode: auto-run reversible actions
 	working   bool // an executor call is in flight
+}
+
+// autoAdvance runs the next decision automatically when auto mode is on and the
+// current action is reversible. Called at every idle transition so auto mode
+// walks the queue on its own, pausing only on a non-reversible action that needs
+// explicit approval.
+func (m replModel) autoAdvance() (tea.Model, tea.Cmd) {
+	if m.auto && !m.working && m.session != nil && !m.session.done() && isReversible(m.session.current().Action) {
+		m.working = true
+		return m, runExecutor(m.exec, m.session.current())
+	}
+	return m, nil
 }
 
 func newREPL(rootCmd *cobra.Command) replModel {
@@ -314,6 +327,7 @@ func (m replModel) onReviewLoaded(msg reviewLoadedMsg) (tea.Model, tea.Cmd) {
 	m.session = session
 	m.exec = msg.exec
 	m.reviewAll = false
+	m.auto = false
 	m.working = false
 	m.output = append(m.output, ui.DimStyle.Render("  Executor: "+msg.label))
 	return m, nil
@@ -324,6 +338,11 @@ func (m replModel) updateReview(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil // ignore input while an action runs
 	}
 	switch msg.String() {
+	case "tab":
+		// Toggle sticky auto-accept. Turning it on runs the next reversible
+		// action immediately; on a non-reversible one it just waits.
+		m.auto = !m.auto
+		return m.autoAdvance()
 	case "a", "y":
 		m.working = true
 		return m, runExecutor(m.exec, m.session.current())
@@ -333,10 +352,18 @@ func (m replModel) updateReview(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, runExecutor(m.exec, m.session.current())
 	case "r", "n":
 		m = m.recordAndLog(types.StatusRejected, "")
-		return m.afterReviewStep(), nil
+		if m.session.done() {
+			return m.exitReview(false), nil
+		}
+		// Resume auto mode on the next item if the operator cleared a
+		// non-reversible one that had paused the queue.
+		return m.autoAdvance()
 	case "s":
 		m = m.recordAndLog(statusSkipped, "")
-		return m.afterReviewStep(), nil
+		if m.session.done() {
+			return m.exitReview(false), nil
+		}
+		return m.autoAdvance()
 	case "q", "esc":
 		m = m.exitReview(true)
 		return m, nil
@@ -354,9 +381,10 @@ func (m replModel) onExecDone(msg execDoneMsg) (tea.Model, tea.Cmd) {
 	}
 	m = m.recordAndLog(msg.status, errStr)
 	m.working = false
-	// A failure pauses "approve all" so the operator can react.
+	// A failure pauses "approve all" and auto mode so the operator can react.
 	if msg.status == types.StatusFailed {
 		m.reviewAll = false
+		m.auto = false
 	}
 	if m.session.done() {
 		return m.exitReview(false), nil
@@ -365,19 +393,12 @@ func (m replModel) onExecDone(msg execDoneMsg) (tea.Model, tea.Cmd) {
 		m.working = true
 		return m, runExecutor(m.exec, m.session.current())
 	}
-	return m, nil
+	return m.autoAdvance()
 }
 
 func (m replModel) recordAndLog(status types.DecisionStatus, errStr string) replModel {
 	m.session.record(status, errStr)
 	m.output = append(m.output, renderOutcome(m.session.outcomes[len(m.session.outcomes)-1]))
-	return m
-}
-
-func (m replModel) afterReviewStep() replModel {
-	if m.session.done() {
-		return m.exitReview(false)
-	}
 	return m
 }
 
@@ -391,6 +412,7 @@ func (m replModel) exitReview(aborted bool) replModel {
 	m.session = nil
 	m.exec = nil
 	m.reviewAll = false
+	m.auto = false
 	m.working = false
 	return m
 }
@@ -415,7 +437,10 @@ func (m replModel) View() string {
 		if m.working {
 			b.WriteString(ui.YellowStyle.Render("  executing...") + "\n")
 		} else {
-			b.WriteString(reviewHint() + "\n")
+			if notice := autoNotice(m.auto, m.session.current()); notice != "" {
+				b.WriteString(notice + "\n")
+			}
+			b.WriteString(reviewHint(m.auto) + "\n")
 		}
 		return b.String()
 	}
