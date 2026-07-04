@@ -198,6 +198,7 @@ Start the continuous monitoring agent with API server.
 | `--model` | `llama3` | LLM model name |
 | `--interval` | `3s` | Monitoring loop interval |
 | `--dry-run` | `true` | Log decisions without executing |
+| `--audit-log` | `` (off) | Append a durable JSONL record of every executed action to this file |
 
 ### `courtvision multi-monitor`
 
@@ -216,6 +217,7 @@ Monitor multiple clusters with one subagent each plus a cross-cluster coordinato
 | `--dry-run` | `true` | Log decisions without executing |
 | `--auto-safe` | `false` | Let each worker auto-execute its own **reversible** decisions (`cordon_node`, `scale_down`, `patch_limits`); `evict_and_move` still waits for approval |
 | `--auto-cooldown` | `3m` | In auto-safe mode, suppress repeat auto-execution of the same action on the same target for this long |
+| `--audit-log` | `` (off) | Append a durable JSONL record of every executed action (all clusters) to this file |
 
 > **Auto-safe** is the unattended tier: each worker heals its own cluster's reversible issues without a human in the loop, while the coordinator's cross-cluster moves stay human-approved. `--dry-run` is still the separate safety switch — `--auto-safe` with `--dry-run=false` performs **real autonomous mutations** on live clusters (the startup banner warns when both are set). The per-target cooldown stops the ~5s analysis loop from re-firing the same fix every tick.
 
@@ -308,12 +310,13 @@ Recently shipped:
 - [x] **Multi-container `patch_limits`** — a pod-level limit target is now distributed across *every* container in the pod in proportion to each container's current limit (the shares sum back to the target), instead of dumping the whole budget onto the first container and ignoring sidecars.
 - [x] **Interactive auto-accept mode** — in the review flow (`analyze --apply` and the REPL `review`), press **Tab** to toggle a sticky auto-accept mode. While on, it auto-runs *reversible* actions (`cordon_node`, `scale_down`, `patch_limits`) but pauses for explicit approval on `evict_and_move`, and turns itself off on the first failure. This is the `auto-safe` tier of graduated autonomy for the interactive surface.
 - [x] **Unattended auto-safe (`multi-monitor`)** — `--auto-safe` makes each per-cluster worker auto-execute its own reversible decisions (`cordon_node`, `scale_down`, `patch_limits`) as they stream in, throttled by a per-target `--auto-cooldown`; `evict_and_move` stays pending for approval.
+- [x] **Durable audit log** — `--audit-log <file>` appends a durable, append-only JSONL record of every executed action across all three approval paths (HTTP approval, `--auto-safe`, interactive review). Each line captures who triggered it (`api-approval` / `auto-safe` / `interactive-review`), the cluster, action, target, the LLM's reasoning, the mode (`live`/`mock`/`dry-run`), and the outcome (`executing` → `executed`/`failed` with duration and any error). Works in single- and multi-cluster mode.
 
 Things still on the list, roughly in priority order:
 - [ ] **Coordinator tests** — the `ClusterWorker` now has auto-safe/cooldown tests, but the `Coordinator` still has none; a test with a stub LLM over cached snapshots is the obvious next addition.
 - [ ] **Per-cluster dashboard** — the React dashboard still targets the single-cluster `/api/*` routes and is not yet aware of `/api/clusters/{cluster}/...` or the coordinator's fleet view.
 - [ ] **Per-cluster overrides in multi-monitor** — `--namespace` and `--dry-run` apply uniformly to every cluster; a config file would let heterogeneous clusters differ.
-- [ ] **Persistent audit log** — decisions and executions live only in an in-memory ring buffer. Anything that mutates a real cluster needs a durable, on-disk record of what changed and why.
+- [ ] **Audit log follow-ups** — the JSONL audit log (above) covers executions; still open are lifecycle events (propose/approve/reject), automatic rotation/retention, a `/api/audit` read endpoint, and tamper-evidence.
 - [ ] **Honor `target_node` in `evict_and_move`** — eviction is best-effort and does not yet pin the pod to the chosen node.
 - [ ] **Remaining autonomy** — the coordinator's cross-cluster decisions are still human-approved, and there is no full-auto tier that also runs non-reversible actions (`evict_and_move`). Both are deliberately left manual for now.
 - [ ] **Document `review` and `analyze --apply`** — the new interactive approval flows in the REPL and CLI are not yet covered in the CLI Reference above.

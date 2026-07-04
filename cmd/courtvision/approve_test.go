@@ -3,6 +3,7 @@ package main
 import (
 	"testing"
 
+	"github.com/atulya-singh/CourtVision/internal/audit"
 	"github.com/atulya-singh/CourtVision/internal/types"
 )
 
@@ -65,7 +66,7 @@ func TestReviewSession_RecordAdvancesAndTallies(t *testing.T) {
 func TestBuildExecutor_DryRunWinsOverK8s(t *testing.T) {
 	// Even with a k8s source, dry-run must never build a mutating executor; the
 	// label proves the dry-run branch short-circuited before touching the cluster.
-	exec, label, err := buildExecutor("k8s", true)
+	exec, label, err := buildExecutor("k8s", true, audit.NewNopSink())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -78,7 +79,7 @@ func TestBuildExecutor_DryRunWinsOverK8s(t *testing.T) {
 }
 
 func TestBuildExecutor_MockForNonK8s(t *testing.T) {
-	exec, label, err := buildExecutor("mock", false)
+	exec, label, err := buildExecutor("mock", false, audit.NewNopSink())
 	if err != nil || exec == nil {
 		t.Fatalf("unexpected: exec=%v err=%v", exec, err)
 	}

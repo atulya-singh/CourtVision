@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/atulya-singh/CourtVision/internal/audit"
 	"github.com/atulya-singh/CourtVision/internal/decision"
 	"github.com/atulya-singh/CourtVision/internal/executor"
 	"github.com/atulya-singh/CourtVision/internal/metrics"
@@ -169,6 +170,9 @@ func (w *ClusterWorker) autoExecute(d types.Decision) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	// Tag the actor so the audit trail attributes this to the unattended
+	// auto-safe loop rather than an operator approval.
+	ctx = audit.WithActor(ctx, "auto-safe")
 	err := w.exec.Execute(ctx, &d)
 	now := time.Now()
 

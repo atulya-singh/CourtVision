@@ -94,6 +94,7 @@ func analyzeCmd() *cobra.Command {
 		namespace  string
 		apply      bool
 		dryRun     bool
+		auditLog   string
 	)
 
 	cmd := &cobra.Command{
@@ -173,11 +174,18 @@ AI-powered analysis.`,
 
 			// 5. Optionally walk the decisions and approve/reject each one.
 			if apply {
-				exec, label, err := buildExecutor(metricsStr, dryRun)
+				sink, auditLabel, err := buildAuditSink(auditLog)
+				if err != nil {
+					return err
+				}
+				defer sink.Close()
+
+				exec, label, err := buildExecutor(metricsStr, dryRun, sink)
 				if err != nil {
 					return fmt.Errorf("failed to create executor: %w", err)
 				}
-				fmt.Printf("\n  %s %s\n\n", ui.DimStyle.Render("Executor:"), ui.CyanStyle.Render(label))
+				fmt.Printf("\n  %s %s\n", ui.DimStyle.Render("Executor:"), ui.CyanStyle.Render(label))
+				fmt.Printf("  %s %s\n\n", ui.DimStyle.Render("Audit log:"), ui.CyanStyle.Render(auditLabel))
 				return runApply(final.result.decisions, exec, label)
 			}
 			return nil
@@ -191,6 +199,7 @@ AI-powered analysis.`,
 	cmd.Flags().StringVar(&namespace, "namespace", "", "Kubernetes namespace to watch (empty = all)")
 	cmd.Flags().BoolVar(&apply, "apply", false, "Interactively approve/reject each decision and run approved ones")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", true, "When applying, log actions without executing them")
+	cmd.Flags().StringVar(&auditLog, "audit-log", "", "Append a durable JSONL record of every executed action to this file (empty = disabled)")
 
 	return cmd
 }

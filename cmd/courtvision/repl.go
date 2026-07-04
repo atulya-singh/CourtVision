@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/atulya-singh/CourtVision/internal/audit"
 	"github.com/atulya-singh/CourtVision/internal/decision"
 	"github.com/atulya-singh/CourtVision/internal/executor"
 	"github.com/atulya-singh/CourtVision/internal/llm"
@@ -304,7 +305,9 @@ func startReview(args []string) tea.Cmd {
 		if err != nil {
 			return reviewLoadedMsg{err: err}
 		}
-		exec, label, err := buildExecutor(metricsSource, metricsSource == "k8s")
+		// The REPL review flow is a sandbox (k8s falls back to dry-run), so its
+		// executions never mutate a real cluster and are not audited.
+		exec, label, err := buildExecutor(metricsSource, metricsSource == "k8s", audit.NewNopSink())
 		if err != nil {
 			return reviewLoadedMsg{err: err}
 		}

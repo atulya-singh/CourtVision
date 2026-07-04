@@ -30,6 +30,7 @@ func monitorCmd() *cobra.Command {
 		namespace  string
 		interval   time.Duration
 		dryRun     bool
+		auditLog   string
 	)
 
 	cmd := &cobra.Command{
@@ -110,19 +111,29 @@ with SSE for real-time updates.`,
 				decision.NewRuleBasedEngine(),
 			)
 
-			// 4. Choose how approved decisions get executed. buildExecutor is
+			// 4. Open the audit log (NopSink when --audit-log is empty) so every
+			//    executed action is recorded durably no matter how it was approved.
+			sink, auditLabel, err := buildAuditSink(auditLog)
+			if err != nil {
+				return err
+			}
+			defer sink.Close()
+			styledLog("Audit log: %s", ui.CyanStyle.Render(auditLabel))
+
+			// 5. Choose how approved decisions get executed. buildExecutor is
 			//    the shared safety switch: --dry-run never mutates anything, a
 			//    real cluster gets the real executor, mock gets a simulated one.
-			exec, execLabel, err := buildExecutor(metricsStr, dryRun)
+			//    The audit sink wraps whichever it picks.
+			exec, execLabel, err := buildExecutor(metricsStr, dryRun, sink)
 			if err != nil {
 				return fmt.Errorf("failed to create executor: %w", err)
 			}
 			styledLog("Executor: %s", ui.CyanStyle.Render(execLabel))
 
-			// 5. Start the monitoring loop in background
+			// 6. Start the monitoring loop in background
 			go styledMonitorLoop(ctx, provider, engine, st, interval)
 
-			// 6. Start the API server — returns when ctx is cancelled (SIGTERM/Ctrl-C)
+			// 7. Start the API server — returns when ctx is cancelled (SIGTERM/Ctrl-C)
 			server := api.NewServer(st, exec, port)
 			styledLog("API server listening on %s", ui.CyanStyle.Render(":"+port))
 			return server.Start(ctx)
@@ -136,6 +147,7 @@ with SSE for real-time updates.`,
 	cmd.Flags().StringVar(&namespace, "namespace", "", "Kubernetes namespace to monitor (empty for all namespaces)")
 	cmd.Flags().DurationVar(&interval, "interval", 3*time.Second, "Monitoring loop interval")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", true, "Log decisions without executing them")
+	cmd.Flags().StringVar(&auditLog, "audit-log", "", "Append a durable JSONL record of every executed action to this file (empty = disabled)")
 
 	return cmd
 }

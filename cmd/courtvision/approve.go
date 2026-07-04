@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/atulya-singh/CourtVision/internal/audit"
 	"github.com/atulya-singh/CourtVision/internal/executor"
 	"github.com/atulya-singh/CourtVision/internal/metrics"
 	"github.com/atulya-singh/CourtVision/internal/types"
@@ -86,22 +87,48 @@ func (s *reviewSession) tally() map[types.DecisionStatus]int {
 }
 
 // buildExecutor selects how approved decisions get carried out. It is the single
-// safety switch shared by every entry point: --dry-run always wins and never
-// mutates anything, a real cluster gets the real executor, and anything else
-// (the mock provider) gets a simulated one.
-func buildExecutor(metricsSource string, dryRun bool) (executor.Executor, string, error) {
+// safety switch shared by every single-cluster entry point: --dry-run always
+// wins and never mutates anything, a real cluster gets the real executor, and
+// anything else (the mock provider) gets a simulated one. The chosen executor is
+// wrapped in an audit decorator so every execution is recorded to sink no matter
+// which entry point ran it; pass a NopSink to disable auditing. The cluster arg
+// to the decorator is empty here, so the record falls back to the decision's own
+// ClusterName.
+func buildExecutor(metricsSource string, dryRun bool, sink audit.Sink) (executor.Executor, string, error) {
+	var (
+		base  executor.Executor
+		label string
+		mode  string
+	)
 	switch {
 	case dryRun:
-		return executor.NewDryRunExecutor(), "dry-run (no changes)", nil
+		base, label, mode = executor.NewDryRunExecutor(), "dry-run (no changes)", "dry-run"
 	case metricsSource == "k8s":
 		e, err := executor.NewK8sExecutor("")
 		if err != nil {
 			return nil, "", err
 		}
-		return e, "LIVE Kubernetes", nil
+		base, label, mode = e, "LIVE Kubernetes", "live"
 	default:
-		return executor.NewMockExecutor(), "mock (simulated)", nil
+		base, label, mode = executor.NewMockExecutor(), "mock (simulated)", "mock"
 	}
+	return audit.NewExecutor(base, sink, "", mode, dryRun), label, nil
+}
+
+// buildAuditSink turns the --audit-log flag into a sink. An empty path disables
+// auditing (NopSink), so callers can always wrap their executor unconditionally.
+// A real path opens a JSONL file in append mode with fsync on — an audit trail
+// of real cluster mutations is worth the flush. It returns a short label for the
+// startup banner and the sink, which the caller must Close on shutdown.
+func buildAuditSink(path string) (audit.Sink, string, error) {
+	if path == "" {
+		return audit.NewNopSink(), "off", nil
+	}
+	sink, err := audit.NewFileSink(path, true)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to open audit log %q: %w", path, err)
+	}
+	return sink, path, nil
 }
 
 // execDoneMsg is delivered to a Bubbletea model when an executor call finishes.
@@ -117,6 +144,9 @@ func runExecutor(exec executor.Executor, d types.Decision) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
+		// Tag the actor so the audit record shows this ran from the interactive
+		// review flow (analyze --apply / REPL review), not an API approval.
+		ctx = audit.WithActor(ctx, "interactive-review")
 		err := exec.Execute(ctx, &d)
 		st := types.StatusExecuted
 		if err != nil {

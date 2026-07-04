@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/atulya-singh/CourtVision/internal/api"
+	"github.com/atulya-singh/CourtVision/internal/audit"
 	"github.com/atulya-singh/CourtVision/internal/cluster"
 	"github.com/atulya-singh/CourtVision/internal/decision"
 	"github.com/atulya-singh/CourtVision/internal/executor"
@@ -34,6 +35,7 @@ func multiMonitorCmd() *cobra.Command {
 		dryRun        bool
 		autoSafe      bool
 		autoCooldown  time.Duration
+		auditLog      string
 	)
 
 	cmd := &cobra.Command{
@@ -85,6 +87,15 @@ cross-cluster decisions under /api/decisions.`,
 				configLines = append(configLines, ui.ConfigLine("Auto-safe:", ui.DimStyle.Render("off")))
 			}
 
+			// Open the audit log once and share it across every worker; a NopSink
+			// when --audit-log is empty keeps the wiring uniform.
+			sink, auditLabel, err := buildAuditSink(auditLog)
+			if err != nil {
+				return err
+			}
+			defer sink.Close()
+			configLines = append(configLines, ui.ConfigLine("Audit log:", auditLabel))
+
 			fmt.Println(ui.ConfigBox.Render(strings.Join(configLines, "\n")))
 			fmt.Println()
 
@@ -123,7 +134,7 @@ cross-cluster decisions under /api/decisions.`,
 					decision.NewRuleBasedEngine(),
 				)
 
-				exec, err := buildClusterExecutor(metricsStr, dryRun, name)
+				exec, err := buildClusterExecutor(metricsStr, dryRun, name, sink)
 				if err != nil {
 					return fmt.Errorf("cluster %q: %w", name, err)
 				}
@@ -160,6 +171,7 @@ cross-cluster decisions under /api/decisions.`,
 	cmd.Flags().BoolVar(&dryRun, "dry-run", true, "Log decisions without executing them")
 	cmd.Flags().BoolVar(&autoSafe, "auto-safe", false, "Let each worker auto-execute its own reversible decisions (cordon_node, scale_down, patch_limits); evict_and_move still waits for approval")
 	cmd.Flags().DurationVar(&autoCooldown, "auto-cooldown", 3*time.Minute, "In auto-safe mode, suppress repeat auto-execution of the same action on the same target for this long")
+	cmd.Flags().StringVar(&auditLog, "audit-log", "", "Append a durable JSONL record of every executed action (all clusters) to this file (empty = disabled)")
 
 	return cmd
 }
@@ -191,14 +203,26 @@ func buildClusterProvider(source, namespace, contextName string) (metrics.Provid
 
 // buildClusterExecutor mirrors buildExecutor's safety switch but targets a
 // specific cluster: --dry-run always wins, a real cluster gets an executor bound
-// to its kubeconfig context, and anything else gets a simulated one.
-func buildClusterExecutor(source string, dryRun bool, contextName string) (executor.Executor, error) {
+// to its kubeconfig context, and anything else gets a simulated one. The result
+// is wrapped in an audit decorator stamped with this cluster's name, so every
+// action a worker takes — whether auto-safe or operator-approved — is recorded
+// against the right cluster in the shared audit log.
+func buildClusterExecutor(source string, dryRun bool, contextName string, sink audit.Sink) (executor.Executor, error) {
+	var (
+		base executor.Executor
+		mode string
+	)
 	switch {
 	case dryRun:
-		return executor.NewDryRunExecutor(), nil
+		base, mode = executor.NewDryRunExecutor(), "dry-run"
 	case source == "k8s":
-		return executor.NewK8sExecutor(contextName)
+		e, err := executor.NewK8sExecutor(contextName)
+		if err != nil {
+			return nil, err
+		}
+		base, mode = e, "live"
 	default:
-		return executor.NewMockExecutor(), nil
+		base, mode = executor.NewMockExecutor(), "mock"
 	}
+	return audit.NewExecutor(base, sink, contextName, mode, dryRun), nil
 }

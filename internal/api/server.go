@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/atulya-singh/CourtVision/internal/audit"
 	"github.com/atulya-singh/CourtVision/internal/cluster"
 	"github.com/atulya-singh/CourtVision/internal/executor"
 	"github.com/atulya-singh/CourtVision/internal/store"
@@ -337,6 +338,9 @@ func executeDecision(st *store.Store, exec executor.Executor, dec *types.Decisio
 
 	execCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	// Tag the actor so the audit trail attributes this to an operator approval
+	// through the HTTP API.
+	execCtx = audit.WithActor(execCtx, "api-approval")
 
 	err := exec.Execute(execCtx, dec)
 	now := time.Now()
