@@ -328,10 +328,16 @@ func (e *K8sExecutor) cordonNode(ctx context.Context, d *types.Decision) error {
 }
 
 // evict removes the target pod so its owning controller recreates it, and the
-// scheduler places the replacement on whichever node has room. We deliberately
-// do not pin the replacement to d.TargetNode: forcing a specific node requires
-// affinity/binding changes that are beyond the scope of a single eviction and
-// can wedge the scheduler. The "move" is therefore best-effort.
+// scheduler places the replacement on whichever node has room.
+//
+// When d.TargetNode is set we honor it as a *precondition* on the destination,
+// not as forced placement. A controller-managed pod is recreated from a shared
+// pod template, so there is no safe per-replacement hook to pin the new pod to a
+// node: mutating the template would pin every replica permanently, and a
+// self-reverting nudge can wedge rolling updates. Instead we refuse to churn a
+// pod toward a node that provably cannot receive it, and treat a pod already on
+// the target as a no-op. The scheduler still owns final placement, so the "move"
+// remains best-effort — but target_node is validated rather than ignored.
 //
 // We submit an Eviction (policy/v1), not a raw Pod delete. The Eviction API
 // routes through the API server's disruption controller, which honors any
@@ -339,6 +345,16 @@ func (e *K8sExecutor) cordonNode(ctx context.Context, d *types.Decision) error {
 // take a service below its safe minimum. A raw Delete would bypass that
 // protection entirely.
 func (e *K8sExecutor) evict(ctx context.Context, d *types.Decision) error {
+	if d.TargetNode != "" {
+		proceed, err := e.evaluateMoveTarget(ctx, d)
+		if err != nil {
+			return err
+		}
+		if !proceed {
+			return nil // pod already on the target node (or already gone) — nothing to move
+		}
+	}
+
 	eviction := &policyv1.Eviction{
 		ObjectMeta: metav1.ObjectMeta{Name: d.TargetPod, Namespace: d.Namespace},
 	}
@@ -357,6 +373,51 @@ func (e *K8sExecutor) evict(ctx context.Context, d *types.Decision) error {
 	default:
 		return err
 	}
+}
+
+// evaluateMoveTarget validates d.TargetNode as a viable destination for the pod.
+// It returns proceed=false when there is nothing to move (the pod is already on
+// the target, or already gone), and an error when the target cannot receive the
+// replacement (it does not exist, is cordoned, or is not Ready) — in which case
+// we fail clean rather than evict a pod toward a dead end where it would only be
+// rescheduled onto the same overloaded node or land Pending.
+func (e *K8sExecutor) evaluateMoveTarget(ctx context.Context, d *types.Decision) (bool, error) {
+	pod, err := e.client.CoreV1().Pods(d.Namespace).Get(ctx, d.TargetPod, metav1.GetOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil // pod already gone; the goal state is already met
+		}
+		return false, fmt.Errorf("get pod %s/%s: %w", d.Namespace, d.TargetPod, err)
+	}
+	if pod.Spec.NodeName == d.TargetNode {
+		return false, nil // already where we want it
+	}
+
+	node, err := e.client.CoreV1().Nodes().Get(ctx, d.TargetNode, metav1.GetOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, fmt.Errorf("evict_and_move: target node %q does not exist", d.TargetNode)
+		}
+		return false, fmt.Errorf("evict_and_move: get target node %q: %w", d.TargetNode, err)
+	}
+	if node.Spec.Unschedulable {
+		return false, fmt.Errorf("evict_and_move: target node %q is cordoned (unschedulable); refusing to move %s/%s there", d.TargetNode, d.Namespace, d.TargetPod)
+	}
+	if !nodeReady(node) {
+		return false, fmt.Errorf("evict_and_move: target node %q is not Ready; refusing to move %s/%s there", d.TargetNode, d.Namespace, d.TargetPod)
+	}
+	return true, nil
+}
+
+// nodeReady reports whether a node's Ready condition is True — the signal that it
+// can actually accept scheduled pods.
+func nodeReady(n *corev1.Node) bool {
+	for _, c := range n.Status.Conditions {
+		if c.Type == corev1.NodeReady {
+			return c.Status == corev1.ConditionTrue
+		}
+	}
+	return false
 }
 
 // workloadRef identifies the top-level controller that owns a pod — the object

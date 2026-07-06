@@ -400,6 +400,109 @@ func TestEvict_AlreadyGoneIsSuccess(t *testing.T) {
 func boolPtr(b bool) *bool    { return &b }
 func int32Ptr(i int32) *int32 { return &i }
 
+// podOnNode builds a running pod already scheduled onto nodeName.
+func podOnNode(name, nodeName string) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+		Spec:       corev1.PodSpec{NodeName: nodeName},
+	}
+}
+
+// node builds a node that is Ready by default; set schedulable=false to cordon it
+// or ready=false to mark it NotReady.
+func node(name string, schedulable, ready bool) *corev1.Node {
+	status := corev1.ConditionFalse
+	if ready {
+		status = corev1.ConditionTrue
+	}
+	return &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec:       corev1.NodeSpec{Unschedulable: !schedulable},
+		Status: corev1.NodeStatus{
+			Conditions: []corev1.NodeCondition{{Type: corev1.NodeReady, Status: status}},
+		},
+	}
+}
+
+// evictionIssued reports whether any recorded action was an Eviction subresource
+// create — i.e. we actually tried to evict rather than skipping/failing pre-flight.
+func evictionIssued(client *fake.Clientset) bool {
+	for _, a := range client.Actions() {
+		if a.GetVerb() == "create" && a.GetResource().Resource == "pods" && a.GetSubresource() == "eviction" {
+			return true
+		}
+	}
+	return false
+}
+
+func TestEvict_MoveToValidNode(t *testing.T) {
+	client := fake.NewSimpleClientset(podOnNode("web-xyz", "node-a"), node("node-b", true, true))
+	e := &K8sExecutor{client: client}
+
+	d := &types.Decision{Action: types.ActionEvictAndMove, Namespace: "default", TargetPod: "web-xyz", TargetNode: "node-b"}
+	if err := e.Execute(context.Background(), d); err != nil {
+		t.Fatalf("moving to a Ready, schedulable node should succeed, got: %v", err)
+	}
+	if !evictionIssued(client) {
+		t.Error("a valid move should still issue an eviction")
+	}
+}
+
+func TestEvict_MoveTargetNodeMissing(t *testing.T) {
+	client := fake.NewSimpleClientset(podOnNode("web-xyz", "node-a")) // node-b absent
+	e := &K8sExecutor{client: client}
+
+	d := &types.Decision{Action: types.ActionEvictAndMove, Namespace: "default", TargetPod: "web-xyz", TargetNode: "node-b"}
+	err := e.Execute(context.Background(), d)
+	if err == nil || !strings.Contains(err.Error(), "does not exist") {
+		t.Fatalf("moving to a missing node should fail clearly, got: %v", err)
+	}
+	if evictionIssued(client) {
+		t.Error("must not evict when the destination node is missing")
+	}
+}
+
+func TestEvict_MoveTargetNodeCordoned(t *testing.T) {
+	client := fake.NewSimpleClientset(podOnNode("web-xyz", "node-a"), node("node-b", false, true))
+	e := &K8sExecutor{client: client}
+
+	d := &types.Decision{Action: types.ActionEvictAndMove, Namespace: "default", TargetPod: "web-xyz", TargetNode: "node-b"}
+	err := e.Execute(context.Background(), d)
+	if err == nil || !strings.Contains(err.Error(), "cordoned") {
+		t.Fatalf("moving to a cordoned node should fail clearly, got: %v", err)
+	}
+	if evictionIssued(client) {
+		t.Error("must not evict toward a cordoned node")
+	}
+}
+
+func TestEvict_MoveTargetNodeNotReady(t *testing.T) {
+	client := fake.NewSimpleClientset(podOnNode("web-xyz", "node-a"), node("node-b", true, false))
+	e := &K8sExecutor{client: client}
+
+	d := &types.Decision{Action: types.ActionEvictAndMove, Namespace: "default", TargetPod: "web-xyz", TargetNode: "node-b"}
+	err := e.Execute(context.Background(), d)
+	if err == nil || !strings.Contains(err.Error(), "not Ready") {
+		t.Fatalf("moving to a NotReady node should fail clearly, got: %v", err)
+	}
+	if evictionIssued(client) {
+		t.Error("must not evict toward a NotReady node")
+	}
+}
+
+func TestEvict_AlreadyOnTargetNodeIsNoOp(t *testing.T) {
+	client := fake.NewSimpleClientset(podOnNode("web-xyz", "node-b"), node("node-b", true, true))
+	e := &K8sExecutor{client: client}
+
+	d := &types.Decision{Action: types.ActionEvictAndMove, Namespace: "default", TargetPod: "web-xyz", TargetNode: "node-b"}
+	if err := e.Execute(context.Background(), d); err != nil {
+		t.Fatalf("a pod already on the target node should be a no-op success, got: %v", err)
+	}
+	if evictionIssued(client) {
+		t.Error("must not evict a pod that is already on the target node")
+	}
+}
+
 // podOwnedBy builds a pod directly controlled by a workload of the given kind, as
 // StatefulSets and DaemonSets own their pods (no intervening ReplicaSet).
 func podOwnedBy(kind, ownerName, podName string) *corev1.Pod {
