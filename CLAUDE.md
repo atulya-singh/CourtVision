@@ -53,7 +53,7 @@ React/TS dashboard.
 | `patch_limits` | Rewrite CPU/mem limits on the owning Deployment, distributed **proportionally across all containers** (sum = pod-level target) | yes (restart) |
 | `scale_down` | Reduce Deployment replicas by 1, hard floor of 1 | yes |
 | `cordon_node` | Mark a node unschedulable | yes |
-| `evict_and_move` | **Delete** the pod (controller reschedules); `target_node` not yet honored | **no** |
+| `evict_and_move` | **Evict** the pod via the Eviction API — honors PodDisruptionBudgets (controller reschedules); `target_node` not yet honored | **no** |
 
 **Decision lifecycle:** `none` (informational) / `pending` → `executing` →
 `executed` | `failed` | `rejected`.
@@ -120,7 +120,7 @@ reject); see `internal/audit/`.
 
 ### `internal/executor/` — the only place real mutations happen (`Executor` interface)
 - `executor.go` — `MockExecutor` (simulated) + `DryRunExecutor` (logs, no-op).
-- `k8s.go` — `K8sExecutor`: real mutations. `patchLimits` distributes the pod-level target across containers proportionally (`distribute` helper); `owningDeployment` walks Pod→ReplicaSet→Deployment. `patch_limits`/`scale_down`/`cordon_node` run under `retry.RetryOnConflict` (Get→mutate→Update refetches per attempt), so a concurrent modification 409 is retried instead of failing; non-conflict errors return immediately.
+- `k8s.go` — `K8sExecutor`: real mutations. `patchLimits` distributes the pod-level target across containers proportionally (`distribute` helper); `owningDeployment` walks Pod→ReplicaSet→Deployment. `patch_limits`/`scale_down`/`cordon_node` run under `retry.RetryOnConflict` (Get→mutate→Update refetches per attempt), so a concurrent modification 409 is retried instead of failing; non-conflict errors return immediately. `evict` submits an Eviction (policy/v1) via `EvictV1`, not a raw Delete, so it honors PodDisruptionBudgets: 429 (PDB block) → clear wrapped error (never falls back to Delete), 404 (already gone) → no-op success.
 
 ### `internal/audit/` — durable, append-only record of every execution
 - `audit.go` — `Event` schema, `Sink` interface, `NopSink` (audit off), `FileSink` (JSONL, mutex + `O_APPEND`, optional fsync), `MultiSink`; `WithActor`/`ActorFrom` carry the triggering actor on the context.
@@ -150,7 +150,7 @@ reject); see `internal/audit/`.
 - Store is in-memory. Executions can be persisted with `--audit-log` (JSONL,
   `internal/audit/`), but decision *lifecycle* events (propose/approve/reject),
   log rotation, and a read API are still open.
-- `evict_and_move` doesn't honor `target_node`; `patch_limits` is the only multi-container-aware action.
+- `evict_and_move` doesn't honor `target_node` (the "move" is best-effort), though it now evicts via the PDB-respecting Eviction API; `patch_limits` is the only multi-container-aware action.
 - `analyze --apply` / `review` are single-cluster (single provider + single non-routing executor). Multi-cluster auto-heal lives in `multi-monitor --auto-safe`.
 
 ## Handy commands

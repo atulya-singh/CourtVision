@@ -8,6 +8,8 @@ import (
 	"github.com/atulya-singh/CourtVision/internal/types"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -228,13 +230,36 @@ func (e *K8sExecutor) cordonNode(ctx context.Context, d *types.Decision) error {
 	})
 }
 
-// evict deletes the target pod. Its owning controller recreates it, and the
+// evict removes the target pod so its owning controller recreates it, and the
 // scheduler places the replacement on whichever node has room. We deliberately
 // do not pin the replacement to d.TargetNode: forcing a specific node requires
 // affinity/binding changes that are beyond the scope of a single eviction and
 // can wedge the scheduler. The "move" is therefore best-effort.
+//
+// We submit an Eviction (policy/v1), not a raw Pod delete. The Eviction API
+// routes through the API server's disruption controller, which honors any
+// PodDisruptionBudget guarding the pod — the whole point of eviction is to not
+// take a service below its safe minimum. A raw Delete would bypass that
+// protection entirely.
 func (e *K8sExecutor) evict(ctx context.Context, d *types.Decision) error {
-	return e.client.CoreV1().Pods(d.Namespace).Delete(ctx, d.TargetPod, metav1.DeleteOptions{})
+	eviction := &policyv1.Eviction{
+		ObjectMeta: metav1.ObjectMeta{Name: d.TargetPod, Namespace: d.Namespace},
+	}
+	err := e.client.CoreV1().Pods(d.Namespace).EvictV1(ctx, eviction)
+	switch {
+	case err == nil:
+		return nil
+	case apierrors.IsNotFound(err):
+		return nil // pod already gone — the goal state is already met
+	case apierrors.IsTooManyRequests(err):
+		// 429 means a PodDisruptionBudget is protecting this pod right now. We
+		// respect the budget and refuse to force it — never fall back to a raw
+		// Delete. Surface a clear, distinguishable failure so the decision is
+		// marked failed and the agent re-evaluates on its next cycle.
+		return fmt.Errorf("eviction of %s/%s blocked by PodDisruptionBudget: %w", d.Namespace, d.TargetPod, err)
+	default:
+		return err
+	}
 }
 
 // owningDeployment walks the ownership chain Pod -> ReplicaSet -> Deployment.

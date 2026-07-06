@@ -312,13 +312,14 @@ Recently shipped:
 - [x] **Unattended auto-safe (`multi-monitor`)** — `--auto-safe` makes each per-cluster worker auto-execute its own reversible decisions (`cordon_node`, `scale_down`, `patch_limits`) as they stream in, throttled by a per-target `--auto-cooldown`; `evict_and_move` stays pending for approval.
 - [x] **Durable audit log** — `--audit-log <file>` appends a durable, append-only JSONL record of every executed action across all three approval paths (HTTP approval, `--auto-safe`, interactive review). Each line captures who triggered it (`api-approval` / `auto-safe` / `interactive-review`), the cluster, action, target, the LLM's reasoning, the mode (`live`/`mock`/`dry-run`), and the outcome (`executing` → `executed`/`failed` with duration and any error). Works in single- and multi-cluster mode.
 - [x] **Conflict-safe LIVE executor** — `patch_limits`, `scale_down`, and `cordon_node` now run their read-modify-write under `RetryOnConflict`, re-fetching a fresh object on each attempt. On a busy cluster where other controllers touch the same Deployment/Node, a `409 Conflict` is retried instead of silently failing the remediation; genuine (non-conflict) errors still surface immediately.
+- [x] **PDB-aware eviction** — `evict_and_move` now goes through the Kubernetes **Eviction API** (`policy/v1`) instead of a raw pod `Delete`, so it honors any **PodDisruptionBudget** guarding the pod. If a PDB would be violated the eviction fails clean with a clear error (it never forces a delete); if the pod is already gone it's treated as done.
 
 Things still on the list, roughly in priority order:
 - [ ] **Coordinator tests** — the `ClusterWorker` now has auto-safe/cooldown tests, but the `Coordinator` still has none; a test with a stub LLM over cached snapshots is the obvious next addition.
 - [ ] **Per-cluster dashboard** — the React dashboard still targets the single-cluster `/api/*` routes and is not yet aware of `/api/clusters/{cluster}/...` or the coordinator's fleet view.
 - [ ] **Per-cluster overrides in multi-monitor** — `--namespace` and `--dry-run` apply uniformly to every cluster; a config file would let heterogeneous clusters differ.
 - [ ] **Audit log follow-ups** — the JSONL audit log (above) covers executions; still open are lifecycle events (propose/approve/reject), automatic rotation/retention, a `/api/audit` read endpoint, and tamper-evidence.
-- [ ] **Honor `target_node` in `evict_and_move`** — eviction is best-effort and does not yet pin the pod to the chosen node.
+- [ ] **Honor `target_node` in `evict_and_move`** — eviction now respects PodDisruptionBudgets (via the Eviction API), but the "move" is still best-effort: it does not yet pin the rescheduled pod to the chosen node.
 - [ ] **Remaining autonomy** — the coordinator's cross-cluster decisions are still human-approved, and there is no full-auto tier that also runs non-reversible actions (`evict_and_move`). Both are deliberately left manual for now.
 - [ ] **Document `review` and `analyze --apply`** — the new interactive approval flows in the REPL and CLI are not yet covered in the CLI Reference above.
 

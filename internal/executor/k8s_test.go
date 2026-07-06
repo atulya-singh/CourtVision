@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/atulya-singh/CourtVision/internal/types"
@@ -322,5 +323,76 @@ func TestPatchLimits_NonConflictErrorNotRetried(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Errorf("non-conflict error must not be retried, reactor fired %d time(s)", calls)
+	}
+}
+
+func TestEvict_UsesEvictionAPINotDelete(t *testing.T) {
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "web-xyz", Namespace: "default"}}
+	client := fake.NewSimpleClientset(pod)
+	e := &K8sExecutor{client: client}
+
+	d := &types.Decision{Action: types.ActionEvictAndMove, Namespace: "default", TargetPod: "web-xyz"}
+	if err := e.Execute(context.Background(), d); err != nil {
+		t.Fatalf("Execute returned error: %v", err)
+	}
+
+	// The core guarantee: we submit an Eviction (which honors PDBs), never a raw
+	// pod Delete (which bypasses them).
+	var sawEviction, sawDelete bool
+	for _, a := range client.Actions() {
+		if a.GetVerb() == "create" && a.GetResource().Resource == "pods" && a.GetSubresource() == "eviction" {
+			sawEviction = true
+		}
+		if a.GetVerb() == "delete" && a.GetResource().Resource == "pods" {
+			sawDelete = true
+		}
+	}
+	if !sawEviction {
+		t.Error("expected an eviction subresource create, saw none")
+	}
+	if sawDelete {
+		t.Error("evict must not issue a raw pod delete (that bypasses PodDisruptionBudgets)")
+	}
+}
+
+func TestEvict_PDBBlockedReturnsError(t *testing.T) {
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "web-xyz", Namespace: "default"}}
+	client := fake.NewSimpleClientset(pod)
+	// A PDB blocking the eviction surfaces as 429 TooManyRequests.
+	client.PrependReactor("create", "pods", func(action clienttesting.Action) (bool, runtime.Object, error) {
+		if action.GetSubresource() != "eviction" {
+			return false, nil, nil
+		}
+		return true, nil, apierrors.NewTooManyRequests("Cannot evict pod as it would violate the pod's disruption budget", 10)
+	})
+	e := &K8sExecutor{client: client}
+
+	d := &types.Decision{Action: types.ActionEvictAndMove, Namespace: "default", TargetPod: "web-xyz"}
+	err := e.Execute(context.Background(), d)
+	if err == nil {
+		t.Fatal("a PDB-blocked eviction must return an error, got nil")
+	}
+	// It must remain identifiable as a 429 (wrapped, not swallowed) and name the pod.
+	if !apierrors.IsTooManyRequests(err) {
+		t.Errorf("blocked eviction should stay a TooManyRequests error, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "web-xyz") {
+		t.Errorf("error should name the target pod, got: %v", err)
+	}
+}
+
+func TestEvict_AlreadyGoneIsSuccess(t *testing.T) {
+	client := fake.NewSimpleClientset() // no pod present
+	client.PrependReactor("create", "pods", func(action clienttesting.Action) (bool, runtime.Object, error) {
+		if action.GetSubresource() != "eviction" {
+			return false, nil, nil
+		}
+		return true, nil, apierrors.NewNotFound(schema.GroupResource{Resource: "pods"}, "web-xyz")
+	})
+	e := &K8sExecutor{client: client}
+
+	d := &types.Decision{Action: types.ActionEvictAndMove, Namespace: "default", TargetPod: "web-xyz"}
+	if err := e.Execute(context.Background(), d); err != nil {
+		t.Errorf("evicting an already-gone pod should be a no-op success, got: %v", err)
 	}
 }
