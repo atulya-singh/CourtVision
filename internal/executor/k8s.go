@@ -13,6 +13,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/homedir"
+	"k8s.io/client-go/util/retry"
 )
 
 // K8sExecutor performs real mutations against a live Kubernetes cluster. Every
@@ -78,43 +79,51 @@ func (e *K8sExecutor) Execute(ctx context.Context, d *types.Decision) error {
 // their current limits, rather than dumping the whole pod budget onto the first
 // container. Each resource is handled independently, and only when the decision
 // actually sets it.
+//
+// The whole read-modify-write runs under RetryOnConflict: on a live cluster other
+// controllers touch the Deployment constantly, so an Update carrying a stale
+// resourceVersion returns a 409 Conflict. We re-resolve and re-apply on conflict
+// (each attempt refetches a fresh object, so distribute recomputes against the
+// current limits); any non-conflict error is returned immediately, unretried.
 func (e *K8sExecutor) patchLimits(ctx context.Context, d *types.Decision) error {
-	dep, err := e.owningDeployment(ctx, d.Namespace, d.TargetPod)
-	if err != nil {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		dep, err := e.owningDeployment(ctx, d.Namespace, d.TargetPod)
+		if err != nil {
+			return err
+		}
+		containers := dep.Spec.Template.Spec.Containers
+		if len(containers) == 0 {
+			return fmt.Errorf("deployment %s has no containers to patch", dep.Name)
+		}
+
+		if d.NewCPULimit > 0 {
+			current := make([]int64, len(containers))
+			for i := range containers {
+				current[i] = containers[i].Resources.Limits.Cpu().MilliValue()
+			}
+			shares := distribute(current, int64(d.NewCPULimit))
+			for i := range containers {
+				ensureLimits(&containers[i])
+				containers[i].Resources.Limits[corev1.ResourceCPU] = *resource.NewMilliQuantity(shares[i], resource.DecimalSI)
+			}
+		}
+
+		if d.NewMemLimit > 0 {
+			current := make([]int64, len(containers))
+			for i := range containers {
+				// Work in MB (not bytes) so total*current stays inside int64 range.
+				current[i] = containers[i].Resources.Limits.Memory().Value() / (1024 * 1024)
+			}
+			shares := distribute(current, int64(d.NewMemLimit))
+			for i := range containers {
+				ensureLimits(&containers[i])
+				containers[i].Resources.Limits[corev1.ResourceMemory] = *resource.NewQuantity(shares[i]*1024*1024, resource.BinarySI)
+			}
+		}
+
+		_, err = e.client.AppsV1().Deployments(dep.Namespace).Update(ctx, dep, metav1.UpdateOptions{})
 		return err
-	}
-	containers := dep.Spec.Template.Spec.Containers
-	if len(containers) == 0 {
-		return fmt.Errorf("deployment %s has no containers to patch", dep.Name)
-	}
-
-	if d.NewCPULimit > 0 {
-		current := make([]int64, len(containers))
-		for i := range containers {
-			current[i] = containers[i].Resources.Limits.Cpu().MilliValue()
-		}
-		shares := distribute(current, int64(d.NewCPULimit))
-		for i := range containers {
-			ensureLimits(&containers[i])
-			containers[i].Resources.Limits[corev1.ResourceCPU] = *resource.NewMilliQuantity(shares[i], resource.DecimalSI)
-		}
-	}
-
-	if d.NewMemLimit > 0 {
-		current := make([]int64, len(containers))
-		for i := range containers {
-			// Work in MB (not bytes) so total*current stays inside int64 range.
-			current[i] = containers[i].Resources.Limits.Memory().Value() / (1024 * 1024)
-		}
-		shares := distribute(current, int64(d.NewMemLimit))
-		for i := range containers {
-			ensureLimits(&containers[i])
-			containers[i].Resources.Limits[corev1.ResourceMemory] = *resource.NewQuantity(shares[i]*1024*1024, resource.BinarySI)
-		}
-	}
-
-	_, err = e.client.AppsV1().Deployments(dep.Namespace).Update(ctx, dep, metav1.UpdateOptions{})
-	return err
+	})
 }
 
 // ensureLimits makes sure a container has a non-nil Limits map before we write to
@@ -166,42 +175,57 @@ func distribute(current []int64, total int64) []int64 {
 // scaleDown reduces the owning Deployment by one replica, never below one. The
 // floor matters: scaling a Deployment to zero is an outage, not an optimisation,
 // so the executor refuses to do it even if asked.
+//
+// Runs under RetryOnConflict so a concurrent modification (e.g. an HPA touching
+// the same Deployment) yields a 409 rather than a lost update. The replica floor
+// is re-checked against the freshly fetched object on every attempt, so if
+// another actor already scaled it to 1 in between, we refuse instead of racing
+// it to zero.
 func (e *K8sExecutor) scaleDown(ctx context.Context, d *types.Decision) error {
-	dep, err := e.owningDeployment(ctx, d.Namespace, d.TargetPod)
-	if err != nil {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		dep, err := e.owningDeployment(ctx, d.Namespace, d.TargetPod)
+		if err != nil {
+			return err
+		}
+
+		current := int32(1)
+		if dep.Spec.Replicas != nil {
+			current = *dep.Spec.Replicas
+		}
+		if current <= 1 {
+			return fmt.Errorf("deployment %s already at %d replica(s); refusing to scale below 1", dep.Name, current)
+		}
+
+		next := current - 1
+		dep.Spec.Replicas = &next
+		_, err = e.client.AppsV1().Deployments(dep.Namespace).Update(ctx, dep, metav1.UpdateOptions{})
 		return err
-	}
-
-	current := int32(1)
-	if dep.Spec.Replicas != nil {
-		current = *dep.Spec.Replicas
-	}
-	if current <= 1 {
-		return fmt.Errorf("deployment %s already at %d replica(s); refusing to scale below 1", dep.Name, current)
-	}
-
-	next := current - 1
-	dep.Spec.Replicas = &next
-	_, err = e.client.AppsV1().Deployments(dep.Namespace).Update(ctx, dep, metav1.UpdateOptions{})
-	return err
+	})
 }
 
 // cordonNode marks a node unschedulable so the scheduler stops placing new pods
 // on it. Existing pods stay put; cordon only affects future scheduling.
+//
+// Runs under RetryOnConflict: node objects are updated frequently (kubelet status,
+// taints, other controllers), so a bare Get/Update loses the race often. The
+// already-cordoned short-circuit is re-evaluated per attempt, so a concurrent
+// cordon resolves to a clean no-op instead of looping.
 func (e *K8sExecutor) cordonNode(ctx context.Context, d *types.Decision) error {
 	if d.TargetNode == "" {
 		return fmt.Errorf("cordon_node requires a target node")
 	}
-	n, err := e.client.CoreV1().Nodes().Get(ctx, d.TargetNode, metav1.GetOptions{})
-	if err != nil {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		n, err := e.client.CoreV1().Nodes().Get(ctx, d.TargetNode, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+		if n.Spec.Unschedulable {
+			return nil // already cordoned, nothing to do
+		}
+		n.Spec.Unschedulable = true
+		_, err = e.client.CoreV1().Nodes().Update(ctx, n, metav1.UpdateOptions{})
 		return err
-	}
-	if n.Spec.Unschedulable {
-		return nil // already cordoned, nothing to do
-	}
-	n.Spec.Unschedulable = true
-	_, err = e.client.CoreV1().Nodes().Update(ctx, n, metav1.UpdateOptions{})
-	return err
+	})
 }
 
 // evict deletes the target pod. Its owning controller recreates it, and the

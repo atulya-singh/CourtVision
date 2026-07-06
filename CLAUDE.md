@@ -120,7 +120,7 @@ reject); see `internal/audit/`.
 
 ### `internal/executor/` — the only place real mutations happen (`Executor` interface)
 - `executor.go` — `MockExecutor` (simulated) + `DryRunExecutor` (logs, no-op).
-- `k8s.go` — `K8sExecutor`: real mutations. `patchLimits` distributes the pod-level target across containers proportionally (`distribute` helper); `owningDeployment` walks Pod→ReplicaSet→Deployment.
+- `k8s.go` — `K8sExecutor`: real mutations. `patchLimits` distributes the pod-level target across containers proportionally (`distribute` helper); `owningDeployment` walks Pod→ReplicaSet→Deployment. `patch_limits`/`scale_down`/`cordon_node` run under `retry.RetryOnConflict` (Get→mutate→Update refetches per attempt), so a concurrent modification 409 is retried instead of failing; non-conflict errors return immediately.
 
 ### `internal/audit/` — durable, append-only record of every execution
 - `audit.go` — `Event` schema, `Sink` interface, `NopSink` (audit off), `FileSink` (JSONL, mutex + `O_APPEND`, optional fsync), `MultiSink`; `WithActor`/`ActorFrom` carry the triggering actor on the context.
