@@ -396,3 +396,170 @@ func TestEvict_AlreadyGoneIsSuccess(t *testing.T) {
 		t.Errorf("evicting an already-gone pod should be a no-op success, got: %v", err)
 	}
 }
+
+func boolPtr(b bool) *bool    { return &b }
+func int32Ptr(i int32) *int32 { return &i }
+
+// podOwnedBy builds a pod directly controlled by a workload of the given kind, as
+// StatefulSets and DaemonSets own their pods (no intervening ReplicaSet).
+func podOwnedBy(kind, ownerName, podName string) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            podName,
+			Namespace:       "default",
+			OwnerReferences: []metav1.OwnerReference{{Kind: kind, Name: ownerName, Controller: boolPtr(true)}},
+		},
+	}
+}
+
+func cpuLimits(cpu string) corev1.ResourceRequirements {
+	return corev1.ResourceRequirements{Limits: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse(cpu)}}
+}
+
+func TestPatchLimits_StatefulSet(t *testing.T) {
+	ss := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "db", Namespace: "default"},
+		Spec: appsv1.StatefulSetSpec{
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "db", Resources: cpuLimits("500m")}}},
+			},
+		},
+	}
+	client := fake.NewSimpleClientset(ss, podOwnedBy("StatefulSet", "db", "db-0"))
+	e := &K8sExecutor{client: client}
+
+	d := &types.Decision{Action: types.ActionPatchLimits, Namespace: "default", TargetPod: "db-0", NewCPULimit: 1000}
+	if err := e.Execute(context.Background(), d); err != nil {
+		t.Fatalf("Execute returned error: %v", err)
+	}
+	got, _ := client.AppsV1().StatefulSets("default").Get(context.Background(), "db", metav1.GetOptions{})
+	if cpu := got.Spec.Template.Spec.Containers[0].Resources.Limits.Cpu().MilliValue(); cpu != 1000 {
+		t.Errorf("statefulset CPU limit = %dm, want 1000m", cpu)
+	}
+}
+
+func TestPatchLimits_DaemonSet(t *testing.T) {
+	ds := &appsv1.DaemonSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "agent", Namespace: "default"},
+		Spec: appsv1.DaemonSetSpec{
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "agent", Resources: cpuLimits("100m")}}},
+			},
+		},
+	}
+	client := fake.NewSimpleClientset(ds, podOwnedBy("DaemonSet", "agent", "agent-abc"))
+	e := &K8sExecutor{client: client}
+
+	d := &types.Decision{Action: types.ActionPatchLimits, Namespace: "default", TargetPod: "agent-abc", NewCPULimit: 250}
+	if err := e.Execute(context.Background(), d); err != nil {
+		t.Fatalf("Execute returned error: %v", err)
+	}
+	got, _ := client.AppsV1().DaemonSets("default").Get(context.Background(), "agent", metav1.GetOptions{})
+	if cpu := got.Spec.Template.Spec.Containers[0].Resources.Limits.Cpu().MilliValue(); cpu != 250 {
+		t.Errorf("daemonset CPU limit = %dm, want 250m", cpu)
+	}
+}
+
+func TestScaleDown_StatefulSet(t *testing.T) {
+	ss := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "db", Namespace: "default"},
+		Spec:       appsv1.StatefulSetSpec{Replicas: int32Ptr(3)},
+	}
+	client := fake.NewSimpleClientset(ss, podOwnedBy("StatefulSet", "db", "db-0"))
+	e := &K8sExecutor{client: client}
+
+	d := &types.Decision{Action: types.ActionScaleDown, Namespace: "default", TargetPod: "db-0"}
+	if err := e.Execute(context.Background(), d); err != nil {
+		t.Fatalf("Execute returned error: %v", err)
+	}
+	got, _ := client.AppsV1().StatefulSets("default").Get(context.Background(), "db", metav1.GetOptions{})
+	if got.Spec.Replicas == nil || *got.Spec.Replicas != 2 {
+		t.Errorf("statefulset replicas = %v, want 2", got.Spec.Replicas)
+	}
+}
+
+func TestScaleDown_DaemonSetRejected(t *testing.T) {
+	ds := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: "agent", Namespace: "default"}}
+	client := fake.NewSimpleClientset(ds, podOwnedBy("DaemonSet", "agent", "agent-abc"))
+	e := &K8sExecutor{client: client}
+
+	d := &types.Decision{Action: types.ActionScaleDown, Namespace: "default", TargetPod: "agent-abc"}
+	err := e.Execute(context.Background(), d)
+	if err == nil {
+		t.Fatal("scaling a DaemonSet must be rejected, got nil")
+	}
+	if !strings.Contains(err.Error(), "daemonset") {
+		t.Errorf("error should explain a DaemonSet is not scalable, got: %v", err)
+	}
+}
+
+func TestPatchLimits_UnsupportedCRDWorkload(t *testing.T) {
+	// A ReplicaSet owned by a CRD controller (e.g. an Argo Rollout), not a
+	// Deployment. We can't mutate the CRD, but the failure must be clear.
+	rs := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "rollout-abc123",
+			Namespace:       "default",
+			OwnerReferences: []metav1.OwnerReference{{Kind: "Rollout", Name: "canary", Controller: boolPtr(true)}},
+		},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "rollout-abc123-xyz",
+			Namespace:       "default",
+			OwnerReferences: []metav1.OwnerReference{{Kind: "ReplicaSet", Name: "rollout-abc123", Controller: boolPtr(true)}},
+		},
+	}
+	client := fake.NewSimpleClientset(rs, pod)
+	e := &K8sExecutor{client: client}
+
+	d := &types.Decision{Action: types.ActionPatchLimits, Namespace: "default", TargetPod: "rollout-abc123-xyz", NewCPULimit: 500}
+	err := e.Execute(context.Background(), d)
+	if err == nil {
+		t.Fatal("patching a CRD-owned workload must fail clearly, got nil")
+	}
+	if !strings.Contains(err.Error(), "unsupported workload kind") || !strings.Contains(err.Error(), "Rollout") {
+		t.Errorf("error should name the unsupported kind, got: %v", err)
+	}
+}
+
+func TestScaleDown_BarePodRejected(t *testing.T) {
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "lonely", Namespace: "default"}} // no owner refs
+	client := fake.NewSimpleClientset(pod)
+	e := &K8sExecutor{client: client}
+
+	d := &types.Decision{Action: types.ActionScaleDown, Namespace: "default", TargetPod: "lonely"}
+	err := e.Execute(context.Background(), d)
+	if err == nil {
+		t.Fatal("scaling a bare pod must fail, got nil")
+	}
+	if !strings.Contains(err.Error(), "bare pod") {
+		t.Errorf("error should explain there is no controlling workload, got: %v", err)
+	}
+}
+
+func TestScaleDown_BareReplicaSet(t *testing.T) {
+	// A ReplicaSet with no higher controller is itself the scalable workload.
+	rs := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "standalone", Namespace: "default"},
+		Spec:       appsv1.ReplicaSetSpec{Replicas: int32Ptr(4)},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "standalone-xyz",
+			Namespace:       "default",
+			OwnerReferences: []metav1.OwnerReference{{Kind: "ReplicaSet", Name: "standalone", Controller: boolPtr(true)}},
+		},
+	}
+	client := fake.NewSimpleClientset(rs, pod)
+	e := &K8sExecutor{client: client}
+
+	d := &types.Decision{Action: types.ActionScaleDown, Namespace: "default", TargetPod: "standalone-xyz"}
+	if err := e.Execute(context.Background(), d); err != nil {
+		t.Fatalf("Execute returned error: %v", err)
+	}
+	got, _ := client.AppsV1().ReplicaSets("default").Get(context.Background(), "standalone", metav1.GetOptions{})
+	if got.Spec.Replicas == nil || *got.Spec.Replicas != 3 {
+		t.Errorf("bare replicaset replicas = %v, want 3", got.Spec.Replicas)
+	}
+}

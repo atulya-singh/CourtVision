@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 
 	"github.com/atulya-singh/CourtVision/internal/types"
-	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -73,59 +72,111 @@ func (e *K8sExecutor) Execute(ctx context.Context, d *types.Decision) error {
 
 // patchLimits raises the resource limits on the workload behind the target pod.
 // A running pod's limits cannot be edited in place, so we patch the owning
-// Deployment instead; Kubernetes then rolls out a new pod with the new limits.
+// workload's pod template instead; Kubernetes then rolls out new pods with the
+// new limits. The workload may be a Deployment, StatefulSet, DaemonSet, or bare
+// ReplicaSet — all of which carry a Spec.Template.Spec.Containers.
 //
 // The decision carries a single pod-level target (NewCPULimit/NewMemLimit),
 // because the metrics that produced it were summed across every container in the
 // pod. We therefore distribute that target across all containers in proportion to
 // their current limits, rather than dumping the whole pod budget onto the first
 // container. Each resource is handled independently, and only when the decision
-// actually sets it.
+// actually sets it (see setContainerLimits).
 //
-// The whole read-modify-write runs under RetryOnConflict: on a live cluster other
-// controllers touch the Deployment constantly, so an Update carrying a stale
-// resourceVersion returns a 409 Conflict. We re-resolve and re-apply on conflict
-// (each attempt refetches a fresh object, so distribute recomputes against the
-// current limits); any non-conflict error is returned immediately, unretried.
+// The workload kind is resolved once (ownership is stable), but the read-modify-
+// write runs under RetryOnConflict: on a live cluster other controllers touch the
+// object constantly, so an Update carrying a stale resourceVersion returns a 409
+// Conflict. Each attempt refetches a fresh object, so distribute recomputes
+// against the current limits; any non-conflict error is returned immediately.
 func (e *K8sExecutor) patchLimits(ctx context.Context, d *types.Decision) error {
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		dep, err := e.owningDeployment(ctx, d.Namespace, d.TargetPod)
-		if err != nil {
-			return err
-		}
-		containers := dep.Spec.Template.Spec.Containers
-		if len(containers) == 0 {
-			return fmt.Errorf("deployment %s has no containers to patch", dep.Name)
-		}
-
-		if d.NewCPULimit > 0 {
-			current := make([]int64, len(containers))
-			for i := range containers {
-				current[i] = containers[i].Resources.Limits.Cpu().MilliValue()
-			}
-			shares := distribute(current, int64(d.NewCPULimit))
-			for i := range containers {
-				ensureLimits(&containers[i])
-				containers[i].Resources.Limits[corev1.ResourceCPU] = *resource.NewMilliQuantity(shares[i], resource.DecimalSI)
-			}
-		}
-
-		if d.NewMemLimit > 0 {
-			current := make([]int64, len(containers))
-			for i := range containers {
-				// Work in MB (not bytes) so total*current stays inside int64 range.
-				current[i] = containers[i].Resources.Limits.Memory().Value() / (1024 * 1024)
-			}
-			shares := distribute(current, int64(d.NewMemLimit))
-			for i := range containers {
-				ensureLimits(&containers[i])
-				containers[i].Resources.Limits[corev1.ResourceMemory] = *resource.NewQuantity(shares[i]*1024*1024, resource.BinarySI)
-			}
-		}
-
-		_, err = e.client.AppsV1().Deployments(dep.Namespace).Update(ctx, dep, metav1.UpdateOptions{})
+	w, err := e.owningWorkload(ctx, d.Namespace, d.TargetPod)
+	if err != nil {
 		return err
+	}
+	apps := e.client.AppsV1()
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		switch w.Kind {
+		case "Deployment":
+			obj, err := apps.Deployments(w.Namespace).Get(ctx, w.Name, metav1.GetOptions{})
+			if err != nil {
+				return err
+			}
+			if err := setContainerLimits(obj.Spec.Template.Spec.Containers, d, w); err != nil {
+				return err
+			}
+			_, err = apps.Deployments(w.Namespace).Update(ctx, obj, metav1.UpdateOptions{})
+			return err
+		case "StatefulSet":
+			obj, err := apps.StatefulSets(w.Namespace).Get(ctx, w.Name, metav1.GetOptions{})
+			if err != nil {
+				return err
+			}
+			if err := setContainerLimits(obj.Spec.Template.Spec.Containers, d, w); err != nil {
+				return err
+			}
+			_, err = apps.StatefulSets(w.Namespace).Update(ctx, obj, metav1.UpdateOptions{})
+			return err
+		case "DaemonSet":
+			obj, err := apps.DaemonSets(w.Namespace).Get(ctx, w.Name, metav1.GetOptions{})
+			if err != nil {
+				return err
+			}
+			if err := setContainerLimits(obj.Spec.Template.Spec.Containers, d, w); err != nil {
+				return err
+			}
+			_, err = apps.DaemonSets(w.Namespace).Update(ctx, obj, metav1.UpdateOptions{})
+			return err
+		case "ReplicaSet":
+			obj, err := apps.ReplicaSets(w.Namespace).Get(ctx, w.Name, metav1.GetOptions{})
+			if err != nil {
+				return err
+			}
+			if err := setContainerLimits(obj.Spec.Template.Spec.Containers, d, w); err != nil {
+				return err
+			}
+			_, err = apps.ReplicaSets(w.Namespace).Update(ctx, obj, metav1.UpdateOptions{})
+			return err
+		default:
+			return unsupportedWorkload("patch_limits", w, d.TargetPod)
+		}
 	})
+}
+
+// setContainerLimits distributes the decision's pod-level CPU/memory targets
+// across the given containers in proportion to their current limits (see
+// distribute), mutating them in place. CPU and memory are each applied only when
+// the decision sets that target. The workloadRef is only used for a clear error
+// message when the template has no containers.
+func setContainerLimits(containers []corev1.Container, d *types.Decision, w workloadRef) error {
+	if len(containers) == 0 {
+		return fmt.Errorf("%s %s/%s has no containers to patch", w.Kind, w.Namespace, w.Name)
+	}
+
+	if d.NewCPULimit > 0 {
+		current := make([]int64, len(containers))
+		for i := range containers {
+			current[i] = containers[i].Resources.Limits.Cpu().MilliValue()
+		}
+		shares := distribute(current, int64(d.NewCPULimit))
+		for i := range containers {
+			ensureLimits(&containers[i])
+			containers[i].Resources.Limits[corev1.ResourceCPU] = *resource.NewMilliQuantity(shares[i], resource.DecimalSI)
+		}
+	}
+
+	if d.NewMemLimit > 0 {
+		current := make([]int64, len(containers))
+		for i := range containers {
+			// Work in MB (not bytes) so total*current stays inside int64 range.
+			current[i] = containers[i].Resources.Limits.Memory().Value() / (1024 * 1024)
+		}
+		shares := distribute(current, int64(d.NewMemLimit))
+		for i := range containers {
+			ensureLimits(&containers[i])
+			containers[i].Resources.Limits[corev1.ResourceMemory] = *resource.NewQuantity(shares[i]*1024*1024, resource.BinarySI)
+		}
+	}
+	return nil
 }
 
 // ensureLimits makes sure a container has a non-nil Limits map before we write to
@@ -174,35 +225,81 @@ func distribute(current []int64, total int64) []int64 {
 	return out
 }
 
-// scaleDown reduces the owning Deployment by one replica, never below one. The
-// floor matters: scaling a Deployment to zero is an outage, not an optimisation,
-// so the executor refuses to do it even if asked.
+// scaleDown reduces the owning workload by one replica, never below one. The
+// floor matters: scaling a workload to zero is an outage, not an optimisation, so
+// the executor refuses to do it even if asked. Deployments, StatefulSets, and
+// bare ReplicaSets are scalable; a DaemonSet runs one pod per node and has no
+// replica count, so scaling it is rejected outright.
 //
 // Runs under RetryOnConflict so a concurrent modification (e.g. an HPA touching
-// the same Deployment) yields a 409 rather than a lost update. The replica floor
-// is re-checked against the freshly fetched object on every attempt, so if
-// another actor already scaled it to 1 in between, we refuse instead of racing
-// it to zero.
+// the same object) yields a 409 rather than a lost update. The replica floor is
+// re-checked against the freshly fetched object on every attempt, so if another
+// actor already scaled it to 1 in between, we refuse instead of racing it to zero.
 func (e *K8sExecutor) scaleDown(ctx context.Context, d *types.Decision) error {
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		dep, err := e.owningDeployment(ctx, d.Namespace, d.TargetPod)
-		if err != nil {
-			return err
-		}
-
-		current := int32(1)
-		if dep.Spec.Replicas != nil {
-			current = *dep.Spec.Replicas
-		}
-		if current <= 1 {
-			return fmt.Errorf("deployment %s already at %d replica(s); refusing to scale below 1", dep.Name, current)
-		}
-
-		next := current - 1
-		dep.Spec.Replicas = &next
-		_, err = e.client.AppsV1().Deployments(dep.Namespace).Update(ctx, dep, metav1.UpdateOptions{})
+	w, err := e.owningWorkload(ctx, d.Namespace, d.TargetPod)
+	if err != nil {
 		return err
+	}
+	apps := e.client.AppsV1()
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		switch w.Kind {
+		case "Deployment":
+			obj, err := apps.Deployments(w.Namespace).Get(ctx, w.Name, metav1.GetOptions{})
+			if err != nil {
+				return err
+			}
+			next, err := decrementedReplicas(obj.Spec.Replicas, w)
+			if err != nil {
+				return err
+			}
+			obj.Spec.Replicas = &next
+			_, err = apps.Deployments(w.Namespace).Update(ctx, obj, metav1.UpdateOptions{})
+			return err
+		case "StatefulSet":
+			obj, err := apps.StatefulSets(w.Namespace).Get(ctx, w.Name, metav1.GetOptions{})
+			if err != nil {
+				return err
+			}
+			next, err := decrementedReplicas(obj.Spec.Replicas, w)
+			if err != nil {
+				return err
+			}
+			obj.Spec.Replicas = &next
+			_, err = apps.StatefulSets(w.Namespace).Update(ctx, obj, metav1.UpdateOptions{})
+			return err
+		case "ReplicaSet":
+			obj, err := apps.ReplicaSets(w.Namespace).Get(ctx, w.Name, metav1.GetOptions{})
+			if err != nil {
+				return err
+			}
+			next, err := decrementedReplicas(obj.Spec.Replicas, w)
+			if err != nil {
+				return err
+			}
+			obj.Spec.Replicas = &next
+			_, err = apps.ReplicaSets(w.Namespace).Update(ctx, obj, metav1.UpdateOptions{})
+			return err
+		case "DaemonSet":
+			return fmt.Errorf("scale_down: daemonset %s/%s runs one pod per node and has no replica count to reduce", w.Namespace, w.Name)
+		default:
+			return unsupportedWorkload("scale_down", w, d.TargetPod)
+		}
 	})
+}
+
+// decrementedReplicas returns replicas-1, enforcing the hard floor of one. A nil
+// pointer is treated as the Kubernetes default of one replica. It refuses (rather
+// than clamps) when already at the floor so the caller reports a clear failure
+// instead of silently no-op'ing.
+func decrementedReplicas(replicas *int32, w workloadRef) (int32, error) {
+	current := int32(1)
+	if replicas != nil {
+		current = *replicas
+	}
+	if current <= 1 {
+		return 0, fmt.Errorf("%s %s/%s already at %d replica(s); refusing to scale below 1", w.Kind, w.Namespace, w.Name, current)
+	}
+	return current - 1, nil
 }
 
 // cordonNode marks a node unschedulable so the scheduler stops placing new pods
@@ -262,41 +359,69 @@ func (e *K8sExecutor) evict(ctx context.Context, d *types.Decision) error {
 	}
 }
 
-// owningDeployment walks the ownership chain Pod -> ReplicaSet -> Deployment.
-// Almost every Deployment-managed pod looks like "web-7d4f-abc12": the pod is
-// owned by a ReplicaSet, which is owned by a Deployment. We need the Deployment
-// because that is the object whose spec actually controls limits and replicas.
-func (e *K8sExecutor) owningDeployment(ctx context.Context, ns, podName string) (*appsv1.Deployment, error) {
-	pod, err := e.client.CoreV1().Pods(ns).Get(ctx, podName, metav1.GetOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("get pod %s/%s: %w", ns, podName, err)
-	}
-
-	rsName := ownerOfKind(pod.OwnerReferences, "ReplicaSet")
-	if rsName == "" {
-		return nil, fmt.Errorf("pod %s is not managed by a ReplicaSet; no Deployment to change", podName)
-	}
-	rs, err := e.client.AppsV1().ReplicaSets(ns).Get(ctx, rsName, metav1.GetOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("get replicaset %s: %w", rsName, err)
-	}
-
-	depName := ownerOfKind(rs.OwnerReferences, "Deployment")
-	if depName == "" {
-		return nil, fmt.Errorf("replicaset %s is not managed by a Deployment", rsName)
-	}
-	dep, err := e.client.AppsV1().Deployments(ns).Get(ctx, depName, metav1.GetOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("get deployment %s: %w", depName, err)
-	}
-	return dep, nil
+// workloadRef identifies the top-level controller that owns a pod — the object
+// whose spec actually governs the pod's limits and replica count. Kind is the
+// Kubernetes kind ("Deployment", "StatefulSet", "DaemonSet", "ReplicaSet", or
+// something a CRD controls like "Rollout").
+type workloadRef struct {
+	Kind      string
+	Namespace string
+	Name      string
 }
 
-func ownerOfKind(refs []metav1.OwnerReference, kind string) string {
-	for _, r := range refs {
-		if r.Kind == kind {
-			return r.Name
+// owningWorkload resolves the top-level controller behind a pod by walking its
+// owner references. A Deployment-managed pod is owned by a ReplicaSet which is in
+// turn owned by the Deployment, so we hop through the ReplicaSet; StatefulSets and
+// DaemonSets own their pods directly. A ReplicaSet with no controller of its own
+// is a bare ReplicaSet (its own top-level workload), and a ReplicaSet owned by a
+// CRD (e.g. an Argo Rollout) surfaces that CRD's kind so the caller can report a
+// clear "unsupported" error rather than a misleading one.
+func (e *K8sExecutor) owningWorkload(ctx context.Context, ns, podName string) (workloadRef, error) {
+	pod, err := e.client.CoreV1().Pods(ns).Get(ctx, podName, metav1.GetOptions{})
+	if err != nil {
+		return workloadRef{}, fmt.Errorf("get pod %s/%s: %w", ns, podName, err)
+	}
+
+	owner := controllerOf(pod.OwnerReferences)
+	if owner == nil {
+		return workloadRef{}, fmt.Errorf("pod %s/%s has no controlling workload (bare pod); nothing to act on", ns, podName)
+	}
+
+	// A ReplicaSet is an intermediary — hop to whatever controls it (usually a
+	// Deployment). If nothing controls it, the ReplicaSet itself is the workload.
+	if owner.Kind == "ReplicaSet" {
+		rs, err := e.client.AppsV1().ReplicaSets(ns).Get(ctx, owner.Name, metav1.GetOptions{})
+		if err != nil {
+			return workloadRef{}, fmt.Errorf("get replicaset %s/%s: %w", ns, owner.Name, err)
+		}
+		if rsOwner := controllerOf(rs.OwnerReferences); rsOwner != nil {
+			return workloadRef{Kind: rsOwner.Kind, Namespace: ns, Name: rsOwner.Name}, nil
+		}
+		return workloadRef{Kind: "ReplicaSet", Namespace: ns, Name: owner.Name}, nil
+	}
+
+	return workloadRef{Kind: owner.Kind, Namespace: ns, Name: owner.Name}, nil
+}
+
+// controllerOf returns the managing controller among a set of owner references.
+// It prefers the reference explicitly marked Controller=true (what Kubernetes
+// stamps on real objects); if none is marked — e.g. a hand-built object in a test
+// — it falls back to the first reference so callers still resolve a workload.
+func controllerOf(refs []metav1.OwnerReference) *metav1.OwnerReference {
+	for i := range refs {
+		if refs[i].Controller != nil && *refs[i].Controller {
+			return &refs[i]
 		}
 	}
-	return ""
+	if len(refs) > 0 {
+		return &refs[0]
+	}
+	return nil
+}
+
+// unsupportedWorkload builds the error returned when an action targets a workload
+// kind the executor cannot mutate (a CRD controller like an Argo Rollout, or a
+// bare pod whose kind we do not recognise).
+func unsupportedWorkload(action string, w workloadRef, podName string) error {
+	return fmt.Errorf("%s: unsupported workload kind %q for pod %s/%s (owned by %s %s)", action, w.Kind, w.Namespace, podName, w.Kind, w.Name)
 }
