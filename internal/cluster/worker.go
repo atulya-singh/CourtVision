@@ -219,12 +219,8 @@ func (w *ClusterWorker) markCooldown(d types.Decision) {
 func (w *ClusterWorker) Name() string { return w.name }
 
 // Store exposes the worker's decision/snapshot store so the API layer can serve
-// per-cluster state and route approvals.
+// per-cluster state read-only.
 func (w *ClusterWorker) Store() *store.Store { return w.store }
-
-// Executor exposes the worker's executor so approved decisions for this cluster
-// run against the right cluster.
-func (w *ClusterWorker) Executor() executor.Executor { return w.exec }
 
 // LatestSnapshot returns the most recent snapshot this worker collected, or nil
 // if it has not completed a tick yet. The Coordinator uses this to read the

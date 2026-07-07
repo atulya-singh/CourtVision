@@ -1,7 +1,6 @@
 package api
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -9,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/atulya-singh/CourtVision/internal/executor"
 	"github.com/atulya-singh/CourtVision/internal/store"
 	"github.com/atulya-singh/CourtVision/internal/types"
 )
@@ -18,15 +16,7 @@ import (
 
 func newServer() (*Server, *store.Store) {
 	st := store.New()
-	return NewServer(st, executor.NewMockExecutor(), "0"), st
-}
-
-func get(t *testing.T, srv *Server, path string) *httptest.ResponseRecorder {
-	t.Helper()
-	req := httptest.NewRequest(http.MethodGet, path, nil)
-	w := httptest.NewRecorder()
-	srv.handleCluster(w, req) // placeholder; each test calls the right handler
-	return w
+	return NewServer(st, "0"), st
 }
 
 func addDecision(st *store.Store, id string) {
@@ -172,177 +162,31 @@ func TestHandleDecisions_MethodNotAllowed(t *testing.T) {
 	}
 }
 
-// ── /api/decisions/{id}/approve|reject ────────────────────────────────────────
+// ── read-only guarantee ───────────────────────────────────────────────────────
 
-func TestHandleDecisionAction_Approve(t *testing.T) {
+// TestMutationRoutesRemoved locks in the read-only contract: the old
+// approve/reject endpoints must not exist, and a decision must never become
+// executable over HTTP. If someone re-adds a mutating route, this fails.
+func TestMutationRoutesRemoved(t *testing.T) {
 	srv, st := newServer()
 	addDecision(st, "id-1")
+	handler := srv.routes()
 
-	req := httptest.NewRequest(http.MethodPost, "/api/decisions/id-1/approve", nil)
-	w := httptest.NewRecorder()
-	srv.handleDecisionAction(w, req)
+	for _, path := range []string{
+		"/api/decisions/id-1/approve",
+		"/api/decisions/id-1/reject",
+	} {
+		req := httptest.NewRequest(http.MethodPost, path, nil)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
 
-	if w.Code != http.StatusOK {
-		t.Errorf("want 200, got %d: %s", w.Code, w.Body.String())
+		if w.Code != http.StatusNotFound {
+			t.Errorf("POST %s: want 404 (route removed), got %d", path, w.Code)
+		}
 	}
 
-	decisions := st.GetDecisions()
-	if !decisions[0].Executed {
-		t.Error("decision should be marked executed after approve")
-	}
-	if decisions[0].ExecutedAt == nil {
-		t.Error("ExecutedAt should be set after approve")
-	}
-}
-
-func TestHandleDecisionAction_Reject(t *testing.T) {
-	srv, st := newServer()
-	addDecision(st, "id-1")
-
-	req := httptest.NewRequest(http.MethodPost, "/api/decisions/id-1/reject", nil)
-	w := httptest.NewRecorder()
-	srv.handleDecisionAction(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Errorf("want 200, got %d", w.Code)
-	}
-
-	decisions := st.GetDecisions()
-	if decisions[0].Executed {
-		t.Error("rejected decision should not be marked executed")
-	}
-	if decisions[0].Error == "" {
-		t.Error("rejected decision should have an error message set")
-	}
-}
-
-// failingExecutor lets us exercise the error path of the approve flow.
-type failingExecutor struct{}
-
-func (failingExecutor) Execute(context.Context, *types.Decision) error {
-	return errTest
-}
-
-var errTest = &testError{"boom"}
-
-type testError struct{ msg string }
-
-func (e *testError) Error() string { return e.msg }
-
-func TestHandleDecisionAction_Approve_SetsExecutedStatus(t *testing.T) {
-	srv, st := newServer()
-	addDecision(st, "id-1")
-
-	req := httptest.NewRequest(http.MethodPost, "/api/decisions/id-1/approve", nil)
-	w := httptest.NewRecorder()
-	srv.handleDecisionAction(w, req)
-
-	d := st.GetDecisions()[0]
-	if d.Status != types.StatusExecuted {
-		t.Errorf("want status %q, got %q", types.StatusExecuted, d.Status)
-	}
-	if !d.Executed {
-		t.Error("approved+executed decision should have Executed=true")
-	}
-}
-
-func TestHandleDecisionAction_Approve_ExecutorFailure(t *testing.T) {
-	st := store.New()
-	srv := NewServer(st, failingExecutor{}, "0")
-	addDecision(st, "id-1")
-
-	req := httptest.NewRequest(http.MethodPost, "/api/decisions/id-1/approve", nil)
-	w := httptest.NewRecorder()
-	srv.handleDecisionAction(w, req)
-
-	d := st.GetDecisions()[0]
-	if d.Status != types.StatusFailed {
-		t.Errorf("want status %q, got %q", types.StatusFailed, d.Status)
-	}
-	if d.Executed {
-		t.Error("a failed execution must not be marked Executed")
-	}
-	if d.Error == "" {
-		t.Error("a failed execution should record the error")
-	}
-}
-
-func TestHandleDecisionAction_RejectsAlreadyExecuted(t *testing.T) {
-	srv, st := newServer()
-	st.AddDecision(types.Decision{ID: "id-1", Action: types.ActionScaleDown, Status: types.StatusExecuted})
-
-	req := httptest.NewRequest(http.MethodPost, "/api/decisions/id-1/approve", nil)
-	w := httptest.NewRecorder()
-	srv.handleDecisionAction(w, req)
-
-	if w.Code != http.StatusConflict {
-		t.Errorf("want 409 for re-approving an executed decision, got %d", w.Code)
-	}
-}
-
-func TestHandleDecisionAction_Reject_SetsRejectedStatus(t *testing.T) {
-	srv, st := newServer()
-	addDecision(st, "id-1")
-
-	req := httptest.NewRequest(http.MethodPost, "/api/decisions/id-1/reject", nil)
-	w := httptest.NewRecorder()
-	srv.handleDecisionAction(w, req)
-
-	d := st.GetDecisions()[0]
-	if d.Status != types.StatusRejected {
-		t.Errorf("want status %q, got %q", types.StatusRejected, d.Status)
-	}
-	if d.Executed {
-		t.Error("rejected decision must not be executed")
-	}
-}
-
-func TestHandleDecisionAction_NotFound(t *testing.T) {
-	srv, _ := newServer()
-
-	req := httptest.NewRequest(http.MethodPost, "/api/decisions/ghost-id/approve", nil)
-	w := httptest.NewRecorder()
-	srv.handleDecisionAction(w, req)
-
-	if w.Code != http.StatusNotFound {
-		t.Errorf("want 404, got %d", w.Code)
-	}
-}
-
-func TestHandleDecisionAction_InvalidAction(t *testing.T) {
-	srv, st := newServer()
-	addDecision(st, "id-1")
-
-	req := httptest.NewRequest(http.MethodPost, "/api/decisions/id-1/delete", nil)
-	w := httptest.NewRecorder()
-	srv.handleDecisionAction(w, req)
-
-	if w.Code != http.StatusBadRequest {
-		t.Errorf("want 400, got %d", w.Code)
-	}
-}
-
-func TestHandleDecisionAction_InvalidPath(t *testing.T) {
-	srv, _ := newServer()
-
-	req := httptest.NewRequest(http.MethodPost, "/api/decisions/only-one-segment", nil)
-	w := httptest.NewRecorder()
-	srv.handleDecisionAction(w, req)
-
-	if w.Code != http.StatusBadRequest {
-		t.Errorf("want 400, got %d", w.Code)
-	}
-}
-
-func TestHandleDecisionAction_MethodNotAllowed(t *testing.T) {
-	srv, _ := newServer()
-
-	req := httptest.NewRequest(http.MethodGet, "/api/decisions/id-1/approve", nil)
-	w := httptest.NewRecorder()
-	srv.handleDecisionAction(w, req)
-
-	if w.Code != http.StatusMethodNotAllowed {
-		t.Errorf("want 405, got %d", w.Code)
+	if d := st.GetDecisions()[0]; d.Executed || d.Status == types.StatusExecuted {
+		t.Error("a decision must not be executable through the HTTP API anymore")
 	}
 }
 
@@ -359,6 +203,9 @@ func TestCORSMiddleware_SetsHeaders(t *testing.T) {
 
 	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "*" {
 		t.Errorf("CORS origin: want *, got %s", got)
+	}
+	if methods := w.Header().Get("Access-Control-Allow-Methods"); strings.Contains(methods, "POST") {
+		t.Errorf("read-only API must not advertise POST, got %q", methods)
 	}
 }
 

@@ -29,8 +29,6 @@ func monitorCmd() *cobra.Command {
 		metricsStr string
 		namespace  string
 		interval   time.Duration
-		dryRun     bool
-		auditLog   string
 	)
 
 	cmd := &cobra.Command{
@@ -42,8 +40,10 @@ real-time dashboard.
 
 The agent runs a monitoring loop at the specified interval,
 collecting metrics from the configured source and sending them
-to the LLM for analysis. Decisions are served via an HTTP API
-with SSE for real-time updates.`,
+to the LLM for analysis. Decisions are served via a read-only HTTP
+API with SSE for real-time updates — the dashboard observes but never
+mutates the cluster. To execute a decision, use 'analyze --apply', the
+REPL review flow, or 'multi-monitor --auto-safe'.`,
 
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -62,11 +62,7 @@ with SSE for real-time updates.`,
 			configLines = append(configLines, ui.ConfigLine("API port:", port))
 			configLines = append(configLines, ui.ConfigLine("Interval:", interval.String()))
 
-			if dryRun {
-				configLines = append(configLines, ui.ConfigLine("Mode:", ui.DryRunBadge))
-			} else {
-				configLines = append(configLines, ui.ConfigLine("Mode:", ui.GreenStyle.Render("LIVE")))
-			}
+			configLines = append(configLines, ui.ConfigLine("Mode:", ui.CyanStyle.Render("observe-only")))
 
 			fmt.Println(ui.ConfigBox.Render(strings.Join(configLines, "\n")))
 			fmt.Println()
@@ -111,31 +107,15 @@ with SSE for real-time updates.`,
 				decision.NewRuleBasedEngine(),
 			)
 
-			// 4. Open the audit log (NopSink when --audit-log is empty) so every
-			//    executed action is recorded durably no matter how it was approved.
-			sink, auditLabel, err := buildAuditSink(auditLog)
-			if err != nil {
-				return err
-			}
-			defer sink.Close()
-			styledLog("Audit log: %s", ui.CyanStyle.Render(auditLabel))
-
-			// 5. Choose how approved decisions get executed. buildExecutor is
-			//    the shared safety switch: --dry-run never mutates anything, a
-			//    real cluster gets the real executor, mock gets a simulated one.
-			//    The audit sink wraps whichever it picks.
-			exec, execLabel, err := buildExecutor(metricsStr, dryRun, sink)
-			if err != nil {
-				return fmt.Errorf("failed to create executor: %w", err)
-			}
-			styledLog("Executor: %s", ui.CyanStyle.Render(execLabel))
-
-			// 6. Start the monitoring loop in background
+			// 4. Start the monitoring loop in background
 			go styledMonitorLoop(ctx, provider, engine, st, interval)
 
-			// 7. Start the API server — returns when ctx is cancelled (SIGTERM/Ctrl-C)
-			server := api.NewServer(st, exec, port)
-			styledLog("API server listening on %s", ui.CyanStyle.Render(":"+port))
+			// 5. Start the read-only API server. The dashboard observes metrics
+			//    and decisions but never mutates the cluster — execution happens
+			//    only through the CLI (analyze --apply, the REPL review flow) or
+			//    autonomously via multi-monitor --auto-safe.
+			server := api.NewServer(st, port)
+			styledLog("Read-only API server listening on %s", ui.CyanStyle.Render(":"+port))
 			return server.Start(ctx)
 		},
 	}
@@ -146,8 +126,6 @@ with SSE for real-time updates.`,
 	cmd.Flags().StringVar(&metricsStr, "metrics", "mock", "Metrics source (mock or k8s)")
 	cmd.Flags().StringVar(&namespace, "namespace", "", "Kubernetes namespace to monitor (empty for all namespaces)")
 	cmd.Flags().DurationVar(&interval, "interval", 3*time.Second, "Monitoring loop interval")
-	cmd.Flags().BoolVar(&dryRun, "dry-run", true, "Log decisions without executing them")
-	cmd.Flags().StringVar(&auditLog, "audit-log", "", "Append a durable JSONL record of every executed action to this file (empty = disabled)")
 
 	return cmd
 }

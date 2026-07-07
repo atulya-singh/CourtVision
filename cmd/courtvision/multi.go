@@ -155,7 +155,8 @@ cross-cluster decisions under /api/decisions.`,
 
 			// Serve per-cluster and fleet-level state until ctx is cancelled.
 			server := api.NewMultiServer(workers, masterStore, port)
-			styledLog("API server listening on %s", ui.CyanStyle.Render(":"+port))
+			styledLog("Read-only API server listening on %s", ui.CyanStyle.Render(":"+port))
+			styledLog("%s", ui.DimStyle.Render("Dashboard is view-only; execution is auto-safe or CLI-driven"))
 			return server.Start(ctx)
 		},
 	}

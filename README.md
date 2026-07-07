@@ -61,9 +61,9 @@ For fleets with more than one cluster, `courtvision multi-monitor` runs a two-ti
         cluster A                cluster B                 cluster C
 ```
 
-- **Subagents (`ClusterWorker`)** — one per cluster, each running the full collect → analyze → store pipeline on its own fast loop. Each owns its own decision store and an executor bound to that cluster's kubeconfig context, so approvals always land on the right cluster.
+- **Subagents (`ClusterWorker`)** — one per cluster, each running the full collect → analyze → store pipeline on its own fast loop. Each owns its own decision store and an executor bound to that cluster's kubeconfig context, so any auto-safe action lands on the right cluster.
 - **Master agent (`Coordinator`)** — runs a deliberately slower loop. It reads each worker's *cached* snapshot (it never collects from clusters itself), asks the LLM to reason about the fleet as a whole, and records cross-cluster decisions in its own store. It only runs once at least two clusters have reported, so cold start and single-cluster cases stay quiet.
-- **Approval routing** — coordinator decisions carry a `target_cluster`; when an operator approves one, it executes against the cluster it targets, not a global executor.
+- **Cluster attribution** — coordinator decisions carry a `target_cluster` so the fleet view can attribute each cross-cluster recommendation to the cluster it targets. These decisions are **surfaced read-only** (advisory); the HTTP API never executes them — auto-safe is per-cluster and reversible-only, and cross-cluster moves stay operator-driven.
 
 The two loops are independently tunable (`--interval` for workers, `--coordinator-interval` for the master). The master is meant to run several times slower than the workers — it reads cached state, so running it faster buys nothing, and cross-cluster moves are strategic decisions that shouldn't be re-litigated every few seconds.
 
@@ -187,7 +187,10 @@ Then open `http://localhost:5173` to see the real-time dashboard with cluster vi
 
 ### `courtvision monitor`
 
-Start the continuous monitoring agent with API server.
+Start the continuous monitoring agent with a **read-only** API server and
+dashboard. The dashboard observes metrics and decisions but never mutates the
+cluster; to execute a decision use `analyze --apply`, the REPL `review` flow, or
+`multi-monitor --auto-safe`.
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -197,8 +200,6 @@ Start the continuous monitoring agent with API server.
 | `--ollama-url` | `http://localhost:11434` | Ollama server URL |
 | `--model` | `llama3` | LLM model name |
 | `--interval` | `3s` | Monitoring loop interval |
-| `--dry-run` | `true` | Log decisions without executing |
-| `--audit-log` | `` (off) | Append a durable JSONL record of every executed action to this file |
 
 ### `courtvision multi-monitor`
 
@@ -219,7 +220,7 @@ Monitor multiple clusters with one subagent each plus a cross-cluster coordinato
 | `--auto-cooldown` | `3m` | In auto-safe mode, suppress repeat auto-execution of the same action on the same target for this long |
 | `--audit-log` | `` (off) | Append a durable JSONL record of every executed action (all clusters) to this file |
 
-> **Auto-safe** is the unattended tier: each worker heals its own cluster's reversible issues without a human in the loop, while the coordinator's cross-cluster moves stay human-approved. `--dry-run` is still the separate safety switch — `--auto-safe` with `--dry-run=false` performs **real autonomous mutations** on live clusters (the startup banner warns when both are set). The per-target cooldown stops the ~5s analysis loop from re-firing the same fix every tick.
+> **Auto-safe** is the unattended tier: each worker heals its own cluster's reversible issues without a human in the loop, while the coordinator's cross-cluster moves stay advisory (surfaced read-only, no auto-execution). `--dry-run` is still the separate safety switch — `--auto-safe` with `--dry-run=false` performs **real autonomous mutations** on live clusters (the startup banner warns when both are set). The per-target cooldown stops the ~5s analysis loop from re-firing the same fix every tick.
 
 ### `courtvision analyze`
 
@@ -280,10 +281,10 @@ CourtVision/
 1. **Metrics Provider** (`mock.go` or `k8s.go`) collects a cluster snapshot every N seconds, stamped with the cluster's name
 2. **LLM Engine** converts the snapshot to a prompt, sends it to Ollama, parses the response into structured decisions
 3. **Store** saves the snapshot and decisions, notifies SSE subscribers
-4. **API Server** serves cluster state via REST and streams decisions via SSE
+4. **API Server** serves cluster state via REST and streams decisions via SSE — **read-only**; it never mutates the cluster
 5. **Dashboard** (React) renders the cluster visually and shows the decision feed in real-time
 
-In multi-agent mode this pipeline runs once per cluster inside a `ClusterWorker`, each with its own store and executor. A `Coordinator` sits on top: it periodically reads every worker's cached snapshot, builds a single cross-cluster prompt, and records fleet-wide decisions in its own store. Because cluster identity flows through `ClusterSnapshot` and `Decision`, decisions are always attributable to the cluster they belong to, and approvals route to the correct cluster's executor.
+In multi-agent mode this pipeline runs once per cluster inside a `ClusterWorker`, each with its own store and executor. A `Coordinator` sits on top: it periodically reads every worker's cached snapshot, builds a single cross-cluster prompt, and records fleet-wide decisions in its own store. Because cluster identity flows through `ClusterSnapshot` and `Decision`, decisions are always attributable to the cluster they belong to; execution happens only through the CLI or a worker's own auto-safe loop, never through the API.
 
 ### Key Design Pattern
 
@@ -305,12 +306,13 @@ This is exactly what makes multi-agent mode cheap: a `ClusterWorker` is just the
 
 Recently shipped:
 
+- [x] **Read-only dashboard & API** — the HTTP API is now GET + SSE only: it serves cluster snapshots and the decision feed for *observation*, and no longer exposes any approve/reject (mutating) route. This removes the "anyone who can reach the dashboard can mutate the cluster" surface entirely — every real mutation now happens behind a locally-authenticated CLI process (`analyze --apply`, the REPL `review`) or a worker's own `--auto-safe` loop, never an anonymous browser. Single-cluster `monitor` is correspondingly observe-only (its `--dry-run`/`--audit-log` flags moved out, since nothing executes there). A regression test locks in that the old approve/reject endpoints return 404.
 - [x] **Multi-cluster, multi-agent mode** — `multi-monitor` runs one subagent per cluster plus a cross-cluster coordinator (see [Multi-Agent Mode](#multi-agent-mode)).
 - [x] **Non-blocking LLM analysis** — collection and analysis now run on separate goroutines. Each loop keeps collecting and publishing fresh snapshots on its interval while LLM analysis runs asynchronously against the latest snapshot (drop-latest hand-off), so a slow or down Ollama never stalls the cycle. The coordinator skips a tick if its previous analysis is still running instead of piling up.
 - [x] **Multi-container `patch_limits`** — a pod-level limit target is now distributed across *every* container in the pod in proportion to each container's current limit (the shares sum back to the target), instead of dumping the whole budget onto the first container and ignoring sidecars.
 - [x] **Interactive auto-accept mode** — in the review flow (`analyze --apply` and the REPL `review`), press **Tab** to toggle a sticky auto-accept mode. While on, it auto-runs *reversible* actions (`cordon_node`, `scale_down`, `patch_limits`) but pauses for explicit approval on `evict_and_move`, and turns itself off on the first failure. This is the `auto-safe` tier of graduated autonomy for the interactive surface.
 - [x] **Unattended auto-safe (`multi-monitor`)** — `--auto-safe` makes each per-cluster worker auto-execute its own reversible decisions (`cordon_node`, `scale_down`, `patch_limits`) as they stream in, throttled by a per-target `--auto-cooldown`; `evict_and_move` stays pending for approval.
-- [x] **Durable audit log** — `--audit-log <file>` appends a durable, append-only JSONL record of every executed action across all three approval paths (HTTP approval, `--auto-safe`, interactive review). Each line captures who triggered it (`api-approval` / `auto-safe` / `interactive-review`), the cluster, action, target, the LLM's reasoning, the mode (`live`/`mock`/`dry-run`), and the outcome (`executing` → `executed`/`failed` with duration and any error). Works in single- and multi-cluster mode.
+- [x] **Durable audit log** — `--audit-log <file>` (on `multi-monitor` and `analyze`) appends a durable, append-only JSONL record of every executed action across the execution paths (`--auto-safe` and interactive review). Each line captures who triggered it (`auto-safe` / `interactive-review`), the cluster, action, target, the LLM's reasoning, the mode (`live`/`mock`/`dry-run`), and the outcome (`executing` → `executed`/`failed` with duration and any error). Implemented as a decorator over the safety-switch executor, so it's a single chokepoint over every path that mutates a cluster.
 - [x] **Conflict-safe LIVE executor** — `patch_limits`, `scale_down`, and `cordon_node` now run their read-modify-write under `RetryOnConflict`, re-fetching a fresh object on each attempt. On a busy cluster where other controllers touch the same Deployment/Node, a `409 Conflict` is retried instead of silently failing the remediation; genuine (non-conflict) errors still surface immediately.
 - [x] **PDB-aware eviction** — `evict_and_move` now goes through the Kubernetes **Eviction API** (`policy/v1`) instead of a raw pod `Delete`, so it honors any **PodDisruptionBudget** guarding the pod. If a PDB would be violated the eviction fails clean with a clear error (it never forces a delete); if the pod is already gone it's treated as done.
 - [x] **Non-Deployment workloads** — `patch_limits` and `scale_down` are no longer Deployment-only. The executor resolves a pod's *top-level* controller and acts on it: `patch_limits` supports **Deployment, StatefulSet, DaemonSet, and bare ReplicaSet**; `scale_down` supports **Deployment, StatefulSet, and ReplicaSet** (a DaemonSet has no replica count, so it's rejected with a clear message). CRD-owned workloads (e.g. Argo Rollouts) and bare pods fail with an explicit "unsupported workload kind" error instead of a misleading one.
@@ -321,7 +323,7 @@ Things still on the list, roughly in priority order:
 - [ ] **Per-cluster dashboard** — the React dashboard still targets the single-cluster `/api/*` routes and is not yet aware of `/api/clusters/{cluster}/...` or the coordinator's fleet view.
 - [ ] **Per-cluster overrides in multi-monitor** — `--namespace` and `--dry-run` apply uniformly to every cluster; a config file would let heterogeneous clusters differ.
 - [ ] **Audit log follow-ups** — the JSONL audit log (above) covers executions; still open are lifecycle events (propose/approve/reject), automatic rotation/retention, a `/api/audit` read endpoint, and tamper-evidence.
-- [ ] **Remaining autonomy** — the coordinator's cross-cluster decisions are still human-approved, and there is no full-auto tier that also runs non-reversible actions (`evict_and_move`). Both are deliberately left manual for now.
+- [ ] **Remaining autonomy** — the coordinator's cross-cluster decisions are surfaced read-only (advisory) with no execution path of their own, and there is no full-auto tier that also runs non-reversible actions (`evict_and_move`). Both are deliberately left manual for now; a CLI-driven review flow for coordinator decisions is the natural next step.
 - [ ] **Document `review` and `analyze --apply`** — the new interactive approval flows in the REPL and CLI are not yet covered in the CLI Reference above.
 
 ## License

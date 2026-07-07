@@ -76,15 +76,7 @@ function StatusBadge({ status }: { status: DecisionStatus }) {
   )
 }
 
-function DecisionCard({
-  decision,
-  isNew,
-  onAction,
-}: {
-  decision: Decision
-  isNew: boolean
-  onAction: (id: string, action: 'approve' | 'reject') => void
-}) {
+function DecisionCard({ decision, isNew }: { decision: Decision; isNew: boolean }) {
   const time = new Date(decision.timestamp).toLocaleTimeString()
   const status = decision.status
 
@@ -110,20 +102,9 @@ function DecisionCard({
         <p className="text-xs text-red-400 mb-3">Execution failed: {decision.error}</p>
       )}
       {status === 'pending' && (
-        <div className="flex gap-2">
-          <button
-            onClick={() => onAction(decision.id, 'approve')}
-            className="px-3 py-1 text-xs font-medium rounded-lg bg-green-500/20 text-green-400 border border-green-500/30 hover:bg-green-500/30 transition-colors cursor-pointer"
-          >
-            Approve
-          </button>
-          <button
-            onClick={() => onAction(decision.id, 'reject')}
-            className="px-3 py-1 text-xs font-medium rounded-lg bg-red-500/20 text-red-400 border border-red-500/30 hover:bg-red-500/30 transition-colors cursor-pointer"
-          >
-            Reject
-          </button>
-        </div>
+        <p className="text-xs text-gray-500 italic">
+          Awaiting approval in the CLI (analyze --apply / review) or auto-safe.
+        </p>
       )}
     </div>
   )
@@ -176,35 +157,6 @@ export default function DecisionFeed() {
     return () => es.close()
   }, [])
 
-  const handleAction = (id: string, action: 'approve' | 'reject') => {
-    // Optimistically move the card out of "pending" so the buttons disappear
-    // immediately and can't be double-clicked. The server then streams back the
-    // real terminal state (executed/failed/rejected) over SSE, which the upsert
-    // handler above applies on top of this.
-    const optimistic: DecisionStatus = action === 'approve' ? 'executing' : 'rejected'
-    setDecisions((prev) =>
-      prev.map((d) => (d.id === id ? { ...d, status: optimistic } : d))
-    )
-
-    // If the action is rejected (e.g. another operator already handled it, 409)
-    // or the network fails, our optimistic guess is wrong. Re-sync from the
-    // server so the card shows the real state instead of a stuck "executing".
-    fetch(`/api/decisions/${id}/${action}`, { method: 'POST' })
-      .then((r) => {
-        if (!r.ok) return resync()
-      })
-      .catch(() => resync())
-  }
-
-  const resync = () => {
-    fetch('/api/decisions')
-      .then((r) => r.json())
-      .then((data: Decision[]) => {
-        if (Array.isArray(data)) setDecisions(data.slice().reverse())
-      })
-      .catch(console.error)
-  }
-
   return (
     <div>
       <div className="flex items-center justify-between mb-4">
@@ -227,7 +179,6 @@ export default function DecisionFeed() {
               key={d.id}
               decision={d}
               isNew={newIdsRef.current.has(d.id)}
-              onAction={handleAction}
             />
           ))
         )}

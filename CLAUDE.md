@@ -41,7 +41,10 @@ React/TS dashboard.
 
 **Two run modes:**
 1. **Single-cluster** (`monitor`) — one pipeline: collect → analyze → serve
-   decisions over an HTTP API + SSE dashboard.
+   decisions over a **read-only** HTTP API + SSE dashboard. `monitor` is
+   observe-only: it has no execution path (no `--dry-run`/`--audit-log` flags),
+   so decisions just surface. Execute via `analyze --apply`, REPL `review`, or
+   `multi-monitor --auto-safe`.
 2. **Multi-cluster, multi-agent** (`multi-monitor`) — one `ClusterWorker`
    subagent per cluster (each runs the full pipeline against its own kubeconfig
    context) plus one master `Coordinator` that reasons *across* clusters (e.g.
@@ -63,28 +66,30 @@ React/TS dashboard.
 - **`--dry-run` (default ON)** = the safety switch: `DryRunExecutor` logs "would…"
   and changes nothing. `mock` metrics → `MockExecutor`. Only `k8s` + LIVE →
   real `K8sExecutor`.
-- **Approval gates:**
-  - HTTP API (`POST /api/.../decisions/{id}/approve`) — one at a time; multi-cluster
-    routes execution by `decision.ClusterName` via `executorFor`.
+- **The HTTP API never mutates.** It is GET + SSE only (no approve/reject route) —
+  the dashboard observes, it doesn't act. Every execution path is a
+  locally-authenticated process, not an anonymous browser:
   - Interactive review (`analyze --apply`, REPL `review`) — `a`/`r`/`s` per item,
     `A` = approve-all, **Tab = sticky auto-accept** (reversible actions only;
     pauses on `evict_and_move`; turns off on failure).
 - **`--auto-safe` (multi-monitor, opt-in)** — each worker auto-executes its own
   **reversible** decisions unattended; `evict_and_move` stays pending; a
   **per-target cooldown** (`--auto-cooldown`, default 3m) stops the ~5s loop from
-  re-firing the same fix. Coordinator decisions stay human-approved.
+  re-firing the same fix. Coordinator (cross-cluster) decisions are surfaced
+  read-only/advisory — they have no execution path of their own.
 
 **Reversible gate:** `types.ActionType.IsReversible()` is the single source of
 truth (cordon/scale_down/patch_limits = true). Used by both the interactive
 auto-accept and worker auto-safe.
 
-**Audit trail:** `--audit-log <file>` (opt-in, off by default) appends a durable
-JSONL record of every *execution* — `executing` → `executed`/`failed` — to a
-file, tagged with the actor (`api-approval`/`auto-safe`/`interactive-review`),
-cluster, action, target, reasoning, mode, duration, and error. Implemented as an
-`AuditingExecutor` decorator wrapping the safety-switch executor, so it's a
-single chokepoint over all paths. Executions only for now (not propose/approve/
-reject); see `internal/audit/`.
+**Audit trail:** `--audit-log <file>` (on `multi-monitor`/`analyze`; opt-in, off
+by default) appends a durable JSONL record of every *execution* — `executing` →
+`executed`/`failed` — to a file, tagged with the actor
+(`auto-safe`/`interactive-review`), cluster, action, target, reasoning, mode,
+duration, and error. Implemented as an `AuditingExecutor` decorator wrapping the
+safety-switch executor, so it's a single chokepoint over every path that mutates
+a cluster. Executions only for now (not propose/approve/reject); see
+`internal/audit/`.
 
 ---
 
@@ -92,7 +97,7 @@ reject); see `internal/audit/`.
 
 ### `cmd/courtvision/` — CLI (Cobra) + terminal UIs (package `main`)
 - `main.go` — root command; registers subcommands; launches REPL when run with no args.
-- `monitor.go` — `monitor` subcommand: single-cluster loop + API server. `styledMonitorLoop` collects on interval and analyzes on a **separate goroutine** (non-blocking).
+- `monitor.go` — `monitor` subcommand: single-cluster loop + **read-only** API server (no executor/audit/`--dry-run` wiring — observe-only). `styledMonitorLoop` collects on interval and analyzes on a **separate goroutine** (non-blocking).
 - `multi.go` — `multi-monitor` subcommand: builds one worker per `--clusters` context + a coordinator; flags incl. `--auto-safe` / `--auto-cooldown`; `buildClusterProvider` / `buildClusterExecutor`.
 - `analyze.go` — `analyze` one-shot: spinner model, prints table/JSON; `--apply` hands decisions to the interactive review.
 - `approve.go` — shared review plumbing: `reviewSession` (pure queue), `buildExecutor` safety switch, `runExecutor`, renderers, `isReversible` (delegates to `types`).
@@ -124,15 +129,15 @@ reject); see `internal/audit/`.
 
 ### `internal/audit/` — durable, append-only record of every execution
 - `audit.go` — `Event` schema, `Sink` interface, `NopSink` (audit off), `FileSink` (JSONL, mutex + `O_APPEND`, optional fsync), `MultiSink`; `WithActor`/`ActorFrom` carry the triggering actor on the context.
-- `executor.go` — `AuditingExecutor`: decorates any `executor.Executor`, records `executing` → `executed`/`failed` around each `Execute`, and **returns the inner error unchanged**. Wrapped once at construction inside `buildExecutor`/`buildClusterExecutor`, so it captures all three execution paths (API approval, auto-safe, interactive review). `audit` imports `executor`, never the reverse — no cycle. Enabled by `--audit-log <file>` on `monitor`/`multi-monitor`/`analyze`.
+- `executor.go` — `AuditingExecutor`: decorates any `executor.Executor`, records `executing` → `executed`/`failed` around each `Execute`, and **returns the inner error unchanged**. Wrapped once at construction inside `buildExecutor`/`buildClusterExecutor`, so it captures both execution paths (auto-safe, interactive review). `audit` imports `executor`, never the reverse — no cycle. Enabled by `--audit-log <file>` on `multi-monitor`/`analyze` (not `monitor`, which is observe-only).
 
 ### `internal/cluster/` — multi-agent topology
 - `worker.go` — `ClusterWorker` (subagent): fast collection loop + separate analyze goroutine; caches latest snapshot for the coordinator; **auto-safe** auto-execution (`processDecisions` / `autoExecute`) + per-target cooldown.
-- `coordinator.go` — `Coordinator` (master): slow loop reading workers' cached snapshots, LLM cross-cluster reasoning, single-flight `busy` guard; decisions stay pending.
+- `coordinator.go` — `Coordinator` (master): slow loop reading workers' cached snapshots, LLM cross-cluster reasoning, single-flight `busy` guard; decisions stay pending (advisory — no execution path).
 - `analysis.go` — shared helpers: `offerLatest` (drop-latest snapshot hand-off) + `recordDecisions` (stamp status + store).
 
-### `internal/api/` — HTTP API + SSE
-- `server.go` — `NewServer` (single) / `NewMultiServer` (fleet). Routes: `/api/cluster`, `/api/decisions`, `/api/events`, and `/api/clusters`, `/api/clusters/{c}/{snapshot,decisions,events,decisions/{id}/{approve|reject}}`. `executorFor` routes approvals by cluster; `executeDecision` runs on a fresh 30s ctx.
+### `internal/api/` — **read-only** HTTP API + SSE
+- `server.go` — `NewServer(store, port)` (single) / `NewMultiServer(workers, masterStore, port)` (fleet). **GET + SSE only — no mutating routes.** Routes: `/api/cluster`, `/api/decisions`, `/api/events`, `/api/health`, and (fleet) `/api/clusters`, `/api/clusters/{c}/{snapshot,decisions,events}`. `routes()` builds the mux (testable); CORS advertises `GET, OPTIONS`. The server holds no executor — approve/reject and the old `executeDecision`/`executorFor` routing were removed so a browser can never trigger a mutation. `server_test.go` has a `TestMutationRoutesRemoved` regression guard.
 
 ### `internal/store/` — in-memory state
 - `store.go` — ring-buffer decision store + snapshot + SSE pub/sub (`Subscribe`/`UpdateAndBroadcast`). **In-memory only** (no persistence yet).
@@ -140,13 +145,13 @@ reject); see `internal/audit/`.
 ### `internal/ui/` — `styles.go`: lipgloss styles, banner, badges (shared by all TUIs).
 
 ### `web/` — React + TypeScript + Vite dashboard
-- `src/components/` — `Dashboard.tsx`, `ClusterOverview.tsx`, `DecisionFeed.tsx`. **Still targets the single-cluster `/api/*` routes** — not yet aware of `/api/clusters/...` (open roadmap item).
+- `src/components/` — `Dashboard.tsx`, `ClusterOverview.tsx`, `DecisionFeed.tsx`. **Read-only viewer** (no approve/reject buttons; `DecisionFeed` fetches `/api/decisions` + subscribes to `/api/events`, and a pending card just shows "awaiting CLI/auto-safe"). **Still targets the single-cluster `/api/*` routes** — not yet aware of `/api/clusters/...` (open roadmap item).
 
 ---
 
 ## Known gaps / deliberate non-goals (see README Roadmap)
-- Coordinator decisions + non-reversible actions stay **human-approved** (no full-auto tier).
-- Dashboard is not multi-cluster-aware yet.
+- Coordinator (cross-cluster) decisions are **advisory / read-only** — surfaced but with no execution path of their own; non-reversible actions stay manual (no full-auto tier).
+- Dashboard is **read-only** (view metrics + decisions; no mutation) and not multi-cluster-aware yet.
 - Store is in-memory. Executions can be persisted with `--audit-log` (JSONL,
   `internal/audit/`), but decision *lifecycle* events (propose/approve/reject),
   log rotation, and a read API are still open.
