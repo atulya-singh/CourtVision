@@ -67,7 +67,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/api/events", s.handleSSE)
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"status":"ok"}`))
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	})
 
 	// Per-cluster routes are only registered when running with workers.
@@ -125,12 +125,12 @@ func renderSnapshot(w http.ResponseWriter, r *http.Request, st *store.Store) {
 	snap := st.GetSnapshot()
 	if snap == nil {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"pods":[],"nodes":[],"timestamp":"0001-01-01T00:00:00Z"}`))
+		_, _ = w.Write([]byte(`{"pods":[],"nodes":[],"timestamp":"0001-01-01T00:00:00Z"}`))
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(snap)
+	_ = json.NewEncoder(w).Encode(snap)
 }
 
 // renderDecisions writes a store's decisions as JSON.
@@ -143,7 +143,7 @@ func renderDecisions(w http.ResponseWriter, r *http.Request, st *store.Store) {
 	decisions := st.GetDecisions()
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(decisions)
+	_ = json.NewEncoder(w).Encode(decisions)
 }
 
 // streamSSE subscribes the caller to a store's decision stream over SSE.
@@ -255,7 +255,7 @@ func (s *Server) handleClusterScoped(w http.ResponseWriter, r *http.Request) {
 
 func writeJSON(w http.ResponseWriter, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(v)
+	_ = json.NewEncoder(w).Encode(v)
 }
 
 func corsMiddleware(next http.Handler) http.Handler {

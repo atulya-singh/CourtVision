@@ -39,7 +39,38 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
+      # Build golangci-lint from source with the job's Go toolchain (Go 1.26 via
+      # go.mod). The prebuilt release binaries lag the Go release and are built
+      # with an older Go; modern golangci-lint then refuses to run against a
+      # module that targets a newer Go ("built with go1.24 < targeted 1.26.1"),
+      # which is what was failing every push. Building from source keeps the
+      # linter's build-Go in lockstep with the module.
+      - name: Install golangci-lint
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+
+      - name: Run golangci-lint
+        run: golangci-lint run ./...
+
+  web:
+    name: Web (typecheck + build)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
         with:
-          version: latest
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install dependencies
+        working-directory: web
+        run: npm ci
+
+      # Typechecks (tsc -b) and compiles the dashboard (vite build). Catches the
+      # kind of TS regression we would otherwise only find by running tsc by hand.
+      - name: Typecheck & build
+        working-directory: web
+        run: npm run build

@@ -1,0 +1,26 @@
+# golangci-lint v2 config.
+#
+# Kept intentionally close to the default linter set, with two pragmatic
+# exclusions so CI is green on idiomatic code:
+#   - the `web/` tree (Vite dashboard) ships a vendored third-party Go file
+#     inside node_modules that we neither own nor lint;
+#   - the `std-error-handling` preset drops the conventional unchecked-error
+#     noise (HTTP ResponseWriter.Write, Close on defer, fmt.Fprintf, ...).
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  exclusions:
+    presets:
+      - std-error-handling
+    rules:
+      # QF1012 is a staticcheck "quickfix" suggestion (rewrite
+      # WriteString(Sprintf) as Fprintf) — purely stylistic, not a bug. Keep the
+      # rest of staticcheck (incl. SA correctness checks) on.
+      - linters:
+          - staticcheck
+        text: QF1012
+    paths:
+      - web
