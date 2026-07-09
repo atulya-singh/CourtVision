@@ -12,6 +12,7 @@ import (
 	"github.com/atulya-singh/CourtVision/internal/decision"
 	"github.com/atulya-singh/CourtVision/internal/executor"
 	"github.com/atulya-singh/CourtVision/internal/llm"
+	"github.com/atulya-singh/CourtVision/internal/metrics"
 	"github.com/atulya-singh/CourtVision/internal/types"
 	"github.com/atulya-singh/CourtVision/internal/ui"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -69,6 +70,10 @@ func checkConnStatus() tea.Msg {
 		resp.Body.Close()
 		s.ollamaOK = resp.StatusCode == http.StatusOK
 	}
+
+	// Check Kubernetes: a cheap /version ping against the current kubeconfig
+	// context, bounded so a missing kubeconfig or dead cluster can't stall the UI.
+	s.k8sOK = metrics.CheckK8sConnectivity("", 2*time.Second).Reachable
 
 	return statusMsg(s)
 }
@@ -669,19 +674,24 @@ func renderHelp() string {
 // source and namespace filter the next command will run under — so the current
 // "mode" is always visible above the prompt.
 func (m replModel) renderModeBar() string {
-	ollamaDot := statusDotRed
-	if m.status.ollamaOK {
-		ollamaDot = statusDotGreen
-	}
 	ns := m.namespace
 	if ns == "" {
 		ns = "all"
 	}
 	sep := statusBarStyle.Render(" · ")
-	return "  " + ollamaDot + statusBarStyle.Render(" ollama") + sep +
+	return "  " + connDot(m.status.ollamaOK) + statusBarStyle.Render(" ollama") + sep +
+		connDot(m.status.k8sOK) + statusBarStyle.Render(" k8s") + sep +
 		statusBarStyle.Render("metrics:") + ui.CyanStyle.Render(m.metrics) + sep +
 		statusBarStyle.Render("ns:") + ui.CyanStyle.Render(ns) + sep +
 		statusBarStyle.Render("sandbox")
+}
+
+// connDot returns the green/red status dot for a connectivity flag.
+func connDot(ok bool) string {
+	if ok {
+		return statusDotGreen
+	}
+	return statusDotRed
 }
 
 // ── Command executor ──────────────────────────────────────────────────────────

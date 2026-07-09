@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/atulya-singh/CourtVision/internal/metrics"
 	"github.com/atulya-singh/CourtVision/internal/ui"
 	"github.com/spf13/cobra"
 )
@@ -20,9 +21,9 @@ func statusCmd() *cobra.Command {
 		Short: "Check connectivity to Ollama and Kubernetes",
 		Long: `Verify that CourtVision can reach its dependencies.
 
-Checks Ollama connectivity and lists installed models.
-In future versions, also checks Kubernetes cluster access
-and metrics-server availability.`,
+Checks Ollama connectivity (and lists installed models) plus
+Kubernetes API-server reachability for the current kubeconfig
+context, reporting the server version when connected.`,
 
 		RunE: func(cmd *cobra.Command, args []string) error {
 			var lines []string
@@ -36,10 +37,7 @@ and metrics-server availability.`,
 
 			// Check Kubernetes
 			lines = append(lines, "")
-			lines = append(lines,
-				fmt.Sprintf("%s  Kubernetes: Not configured %s",
-					ui.Dot,
-					ui.DimStyle.Render("(use --metrics k8s to enable)")))
+			lines = append(lines, checkK8sStyled("")...)
 
 			content := strings.Join(lines, "\n")
 			fmt.Println()
@@ -53,6 +51,36 @@ and metrics-server availability.`,
 	cmd.Flags().StringVar(&ollamaURL, "ollama-url", "http://localhost:11434", "Ollama server URL")
 
 	return cmd
+}
+
+// checkK8sStyled probes the API server for the current kubeconfig context and
+// renders the result the same way the Ollama check does: connected with the
+// resolved context + server version, or not-reachable with the error and a hint.
+func checkK8sStyled(contextName string) []string {
+	st := metrics.CheckK8sConnectivity(contextName, 5*time.Second)
+	if !st.Reachable {
+		ctx := st.Context
+		if ctx == "" {
+			ctx = "no current context"
+		}
+		lines := []string{
+			fmt.Sprintf("%s  Kubernetes: Not reachable %s",
+				ui.CrossMark, ui.DimStyle.Render("("+ctx+")")),
+		}
+		if st.Err != nil {
+			lines = append(lines,
+				fmt.Sprintf("   %s %v", ui.DimStyle.Render("Error:"), st.Err))
+		}
+		lines = append(lines,
+			fmt.Sprintf("   %s", ui.DimStyle.Render("Is your kubeconfig set and the cluster running? Try: kubectl cluster-info")))
+		return lines
+	}
+	return []string{
+		fmt.Sprintf("%s  Kubernetes: Connected %s",
+			ui.CheckMark, ui.DimStyle.Render("(context: "+st.Context+")")),
+		fmt.Sprintf("   %s %s",
+			ui.DimStyle.Render("Server:"), ui.CyanStyle.Render(st.ServerVersion)),
+	}
 }
 
 type ollamaTagsResponse struct {

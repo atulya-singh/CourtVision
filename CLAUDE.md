@@ -110,7 +110,7 @@ via `audit.VerifyChain` / the `courtvision audit-verify <file>` command. Coordin
 - `apply.go` — `applyModel`: standalone Bubbletea review screen for `analyze --apply`. Has the Tab auto-accept toggle + `autoAdvance`. **Can run LIVE.**
 - `repl.go` — interactive REPL; `review` runs the inline approval flow (sandboxed: mock→mock, k8s→dry-run). Mirrors `apply.go`'s auto-accept. **Slash-command palette:** typing `/` opens a live-filtered, ↑/↓-navigable dropdown (`refreshPalette`/`completeSelected`/`paletteChoice`); `Tab` completes, `Enter` runs the highlight, `Esc` dismisses; `↑/↓` still cycle history when the palette is closed. **Session modes:** `metrics`/`namespace` persist across commands (set via `/metrics`, `/namespace`, or `Shift+Tab` to toggle mock↔k8s), shown in a `renderModeBar` status line and folded into each command by `dispatch` (bare words still resolve for back-compat). Long-running servers (`/monitor`, `/multi-monitor`) print a shell hint instead of blocking the event loop.
 - `slash.go` — the REPL command registry (`slashCommand`/`cmdKind`/`slashCommands`): single source of truth shared by the palette, the `dispatch` router, and `renderHelp`, so they never drift. `matchSlash` (prefix/alias filter), `lookupSlash` (exact resolve), `cobraArgsFor` (mode→flags), `externalHint`, `renderPalette`.
-- `status.go` — `status` subcommand (Ollama/K8s connectivity check).
+- `status.go` — `status` subcommand: real Ollama (`checkOllamaStyled`) **and** Kubernetes (`checkK8sStyled` → `metrics.CheckK8sConnectivity`) connectivity checks — shows the resolved context + server version when reachable, or the error + a `kubectl cluster-info` hint.
 - `audit_verify.go` — `audit-verify <file>` subcommand: parses a JSONL audit log and runs `audit.VerifyChain`, reporting the first tampered/dropped event (non-zero exit) or confirming the chain is intact.
 - `*_test.go` — review-flow + auto-accept Update-loop tests.
 
@@ -118,7 +118,7 @@ via `audit.VerifyChain` / the `courtvision audit-verify <file>` command. Coordin
 - `types.go` — `Decision`, `ClusterSnapshot`, `PodMetrics`, `NodeMetrics`, action/severity/status enums, `ActionType.IsReversible()`. **Note:** JSON tag casing is intentionally mixed (`Decision.ClusterName` = `"ClusterName"`, `ClusterSnapshot.ClusterName` = `"clusterName"`) — do not "fix".
 
 ### `internal/metrics/` — metrics providers (`Provider` interface)
-- `k8s.go` — `K8sProvider`: real metrics via client-go + metrics-server; `NewK8sProvider(namespace, contextName)` targets a kubeconfig context. Pod limits/usage are **summed across containers**.
+- `k8s.go` — `K8sProvider`: real metrics via client-go + metrics-server; `NewK8sProvider(namespace, contextName)` targets a kubeconfig context. Pod limits/usage are **summed across containers**. Kubeconfig loading is factored into `restConfig(contextName)`, shared with `CheckK8sConnectivity(context, timeout) K8sStatus` — a cheap `/version` liveness probe (`probeVersion`, no metrics-server/list, bounded by `config.Timeout`) used by `status` and the REPL banner to show whether the API server is actually reachable.
 - `mock.go` — `MockProvider`: deterministic fake snapshots; `NewMockProvider(clusterName)`. No cluster/LLM needed.
 
 ### `internal/llm/` — LLM analysis

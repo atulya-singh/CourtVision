@@ -9,6 +9,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/homedir"
 	metricsv "k8s.io/metrics/pkg/client/clientset/versioned"
@@ -35,15 +36,14 @@ type K8sProvider struct {
 	clusterName   string
 }
 
-// NewK8sProvider builds a provider for a single cluster. contextName selects
-// which kubeconfig context to target; passing "" falls back to the kubeconfig's
-// current-context (the original single-cluster behavior). The resolved context
-// name is stamped onto every snapshot so decisions can be attributed to the
-// right cluster in a multi-cluster setup.
-func NewK8sProvider(namespace, contextName string) (*K8sProvider, error) {
+// restConfig loads the kubeconfig (~/.kube/config) and resolves the effective
+// context name. contextName selects which context to target; "" falls back to
+// the kubeconfig's current-context. Shared by NewK8sProvider and the lightweight
+// connectivity probe so both speak the same kubeconfig vocabulary.
+func restConfig(contextName string) (*rest.Config, string, error) {
 	home := homedir.HomeDir()
 	if home == "" {
-		return nil, fmt.Errorf("could not find home directory")
+		return nil, "", fmt.Errorf("could not find home directory")
 	}
 	kubeconfigPath := filepath.Join(home, ".kube", "config")
 
@@ -56,16 +56,29 @@ func NewK8sProvider(namespace, contextName string) (*K8sProvider, error) {
 
 	config, err := clientConfig.ClientConfig()
 	if err != nil {
-		return nil, fmt.Errorf("failed to load kubeconfig: %w", err)
+		return nil, "", fmt.Errorf("failed to load kubeconfig: %w", err)
 	}
 
 	// Resolve the effective context name so a caller relying on the
-	// current-context still gets a meaningful cluster label on its snapshots.
+	// current-context still gets a meaningful cluster label.
 	clusterName := contextName
 	if clusterName == "" {
 		if rawConfig, err := clientConfig.RawConfig(); err == nil {
 			clusterName = rawConfig.CurrentContext
 		}
+	}
+	return config, clusterName, nil
+}
+
+// NewK8sProvider builds a provider for a single cluster. contextName selects
+// which kubeconfig context to target; passing "" falls back to the kubeconfig's
+// current-context (the original single-cluster behavior). The resolved context
+// name is stamped onto every snapshot so decisions can be attributed to the
+// right cluster in a multi-cluster setup.
+func NewK8sProvider(namespace, contextName string) (*K8sProvider, error) {
+	config, clusterName, err := restConfig(contextName)
+	if err != nil {
+		return nil, err
 	}
 
 	coreClient, err := kubernetes.NewForConfig(config)
@@ -84,6 +97,44 @@ func NewK8sProvider(namespace, contextName string) (*K8sProvider, error) {
 		namespace:     namespace,
 		clusterName:   clusterName,
 	}, nil
+}
+
+// K8sStatus is the outcome of a lightweight API-server connectivity probe.
+type K8sStatus struct {
+	Context       string // resolved kubeconfig context ("" if none could be loaded)
+	ServerVersion string // e.g. "v1.29.0" when reachable
+	Reachable     bool
+	Err           error // why the probe failed (nil when Reachable)
+}
+
+// CheckK8sConnectivity loads the kubeconfig (contextName "" = current-context)
+// and pings the API server's /version endpoint under the given timeout. It is a
+// cheap liveness probe — no metrics-server, no listing — used by `status` and
+// the REPL banner to show whether Kubernetes is actually reachable. It never
+// blocks longer than timeout and never panics: every failure is reported in the
+// returned K8sStatus.
+func CheckK8sConnectivity(contextName string, timeout time.Duration) K8sStatus {
+	config, clusterName, err := restConfig(contextName)
+	if err != nil {
+		return K8sStatus{Context: clusterName, Err: err}
+	}
+	config.Timeout = timeout // bound the /version request
+
+	client, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return K8sStatus{Context: clusterName, Err: err}
+	}
+	return probeVersion(client, clusterName)
+}
+
+// probeVersion asks the discovery endpoint for the server version. Split from
+// CheckK8sConnectivity so it can be unit-tested with a fake clientset.
+func probeVersion(client kubernetes.Interface, clusterName string) K8sStatus {
+	ver, err := client.Discovery().ServerVersion()
+	if err != nil {
+		return K8sStatus{Context: clusterName, Err: err}
+	}
+	return K8sStatus{Context: clusterName, ServerVersion: ver.String(), Reachable: true}
 }
 
 func (k *K8sProvider) GetClusterSnapshot() (*types.ClusterSnapshot, error) {
