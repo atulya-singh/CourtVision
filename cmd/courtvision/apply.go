@@ -3,6 +3,7 @@ package main
 import (
 	"strings"
 
+	"github.com/atulya-singh/CourtVision/internal/audit"
 	"github.com/atulya-singh/CourtVision/internal/executor"
 	"github.com/atulya-singh/CourtVision/internal/types"
 	"github.com/atulya-singh/CourtVision/internal/ui"
@@ -18,6 +19,7 @@ import (
 type applyModel struct {
 	session    *reviewSession
 	exec       executor.Executor
+	sink       audit.Sink // records rejections; executions are audited inside exec
 	execLabel  string
 	log        []string
 	working    bool // an executor call is in flight
@@ -39,10 +41,14 @@ func (m applyModel) autoAdvance() (applyModel, tea.Cmd) {
 	return m, nil
 }
 
-func newApplyModel(decisions []types.Decision, exec executor.Executor, label string) applyModel {
+func newApplyModel(decisions []types.Decision, exec executor.Executor, label string, sink audit.Sink) applyModel {
+	if sink == nil {
+		sink = audit.NewNopSink()
+	}
 	return applyModel{
 		session:   newReviewSession(decisions),
 		exec:      exec,
+		sink:      sink,
 		execLabel: label,
 	}
 }
@@ -94,6 +100,10 @@ func (m applyModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.working = true
 			return m, runExecutor(m.exec, m.session.current())
 		case "r", "n":
+			// A rejection produces no execution, so the executor's audit path never
+			// sees it. Record it here so the durable trail shows the operator's call.
+			rejected := m.session.current()
+			m.sink.Record(audit.Lifecycle("interactive-review", audit.PhaseRejected, "", &rejected))
 			m.session.record(types.StatusRejected, "")
 			m.log = append(m.log, renderOutcome(m.session.outcomes[len(m.session.outcomes)-1]))
 			if m.session.done() {
@@ -149,9 +159,10 @@ func (m applyModel) View() string {
 }
 
 // runApply launches the interactive approval screen for the given decisions.
-// It returns nil when there is nothing actionable to review.
-func runApply(decisions []types.Decision, exec executor.Executor, label string) error {
-	m := newApplyModel(decisions, exec, label)
+// It returns nil when there is nothing actionable to review. sink records
+// rejections to the audit trail (executions are audited inside exec).
+func runApply(decisions []types.Decision, exec executor.Executor, label string, sink audit.Sink) error {
+	m := newApplyModel(decisions, exec, label, sink)
 	if m.session.total() == 0 {
 		return nil
 	}

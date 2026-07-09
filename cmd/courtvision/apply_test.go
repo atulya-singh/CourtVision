@@ -15,7 +15,7 @@ func TestApplyAutoModeRunsReversible(t *testing.T) {
 	m := newApplyModel([]types.Decision{
 		{ID: "1", Action: types.ActionCordonNode, TargetNode: "n1"},
 		{ID: "2", Action: types.ActionScaleDown, TargetPod: "p2", Namespace: "ns"},
-	}, executor.NewMockExecutor(), "mock")
+	}, executor.NewMockExecutor(), "mock", nil)
 
 	model, cmd := m.Update(tabKey())
 	m = model.(applyModel)
@@ -44,7 +44,7 @@ func TestApplyAutoModeRunsReversible(t *testing.T) {
 func TestApplyAutoModePausesOnRisky(t *testing.T) {
 	m := newApplyModel([]types.Decision{
 		{ID: "1", Action: types.ActionEvictAndMove, TargetPod: "p1", Namespace: "ns"},
-	}, executor.NewMockExecutor(), "mock")
+	}, executor.NewMockExecutor(), "mock", nil)
 
 	model, cmd := m.Update(tabKey())
 	m = model.(applyModel)

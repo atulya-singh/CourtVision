@@ -36,6 +36,7 @@ func multiMonitorCmd() *cobra.Command {
 		autoSafe      bool
 		autoCooldown  time.Duration
 		auditLog      string
+		auditMaxBytes int64
 	)
 
 	cmd := &cobra.Command{
@@ -87,9 +88,10 @@ cross-cluster decisions under /api/decisions.`,
 				configLines = append(configLines, ui.ConfigLine("Auto-safe:", ui.DimStyle.Render("off")))
 			}
 
-			// Open the audit log once and share it across every worker; a NopSink
-			// when --audit-log is empty keeps the wiring uniform.
-			sink, auditLabel, err := buildAuditSink(auditLog)
+			// Open the audit trail once and share it across every worker. The
+			// in-memory ring always exists (so /api/audit works); a file is added
+			// when --audit-log is set. auditReader backs the read-only API.
+			sink, auditReader, auditLabel, err := buildAuditSink(auditLog, auditMaxBytes)
 			if err != nil {
 				return err
 			}
@@ -154,7 +156,7 @@ cross-cluster decisions under /api/decisions.`,
 			go coord.Run(ctx)
 
 			// Serve per-cluster and fleet-level state until ctx is cancelled.
-			server := api.NewMultiServer(workers, masterStore, port)
+			server := api.NewMultiServer(workers, masterStore, auditReader, port)
 			styledLog("Read-only API server listening on %s", ui.CyanStyle.Render(":"+port))
 			styledLog("%s", ui.DimStyle.Render("Dashboard is view-only; execution is auto-safe or CLI-driven"))
 			return server.Start(ctx)
@@ -173,6 +175,7 @@ cross-cluster decisions under /api/decisions.`,
 	cmd.Flags().BoolVar(&autoSafe, "auto-safe", false, "Let each worker auto-execute its own reversible decisions (cordon_node, scale_down, patch_limits); evict_and_move still waits for approval")
 	cmd.Flags().DurationVar(&autoCooldown, "auto-cooldown", 3*time.Minute, "In auto-safe mode, suppress repeat auto-execution of the same action on the same target for this long")
 	cmd.Flags().StringVar(&auditLog, "audit-log", "", "Append a durable JSONL record of every executed action (all clusters) to this file (empty = disabled)")
+	cmd.Flags().Int64Var(&auditMaxBytes, "audit-max-bytes", 0, "Rotate the audit log when it exceeds this many bytes, keeping a few numbered backups (0 = never rotate)")
 
 	return cmd
 }

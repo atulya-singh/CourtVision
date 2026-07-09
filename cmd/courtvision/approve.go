@@ -115,20 +115,31 @@ func buildExecutor(metricsSource string, dryRun bool, sink audit.Sink) (executor
 	return audit.NewExecutor(base, sink, "", mode, dryRun), label, nil
 }
 
-// buildAuditSink turns the --audit-log flag into a sink. An empty path disables
-// auditing (NopSink), so callers can always wrap their executor unconditionally.
-// A real path opens a JSONL file in append mode with fsync on — an audit trail
-// of real cluster mutations is worth the flush. It returns a short label for the
-// startup banner and the sink, which the caller must Close on shutdown.
-func buildAuditSink(path string) (audit.Sink, string, error) {
+// auditBackups is how many rotated audit files (<path>.1 .. <path>.N) to keep
+// when --audit-max-bytes enables rotation.
+const auditBackups = 5
+
+// buildAuditSink turns the --audit-log flag into a sink plus an in-memory reader
+// for the read API. It always keeps a bounded in-memory ring (so /api/audit works
+// even without a file); when path is set it also opens a rotating JSONL file with
+// fsync on — an audit trail of real cluster mutations is worth the flush — and
+// fans out to both via a MultiSink. maxBytes > 0 caps the file with rotation; 0
+// keeps it unbounded. It returns the write sink, the reader the server serves
+// from, and a short banner label. The caller must Close the sink on shutdown.
+func buildAuditSink(path string, maxBytes int64) (audit.Sink, *audit.MemorySink, string, error) {
+	mem := audit.NewMemorySink(1000)
 	if path == "" {
-		return audit.NewNopSink(), "off", nil
+		return mem, mem, ui.DimStyle.Render("off (in-memory only; /api/audit live)"), nil
 	}
-	sink, err := audit.NewFileSink(path, true)
+	file, err := audit.NewFileSink(path, true, maxBytes, auditBackups)
 	if err != nil {
-		return nil, "", fmt.Errorf("failed to open audit log %q: %w", path, err)
+		return nil, nil, "", fmt.Errorf("failed to open audit log %q: %w", path, err)
 	}
-	return sink, path, nil
+	label := path
+	if maxBytes > 0 {
+		label += ui.DimStyle.Render(fmt.Sprintf(" (rotate >%d bytes, keep %d)", maxBytes, auditBackups))
+	}
+	return audit.NewMultiSink(file, mem), mem, label, nil
 }
 
 // execDoneMsg is delivered to a Bubbletea model when an executor call finishes.

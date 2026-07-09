@@ -92,9 +92,10 @@ func analyzeCmd() *cobra.Command {
 		metricsStr string
 		output     string
 		namespace  string
-		apply      bool
-		dryRun     bool
-		auditLog   string
+		apply         bool
+		dryRun        bool
+		auditLog      string
+		auditMaxBytes int64
 	)
 
 	cmd := &cobra.Command{
@@ -174,7 +175,7 @@ AI-powered analysis.`,
 
 			// 5. Optionally walk the decisions and approve/reject each one.
 			if apply {
-				sink, auditLabel, err := buildAuditSink(auditLog)
+				sink, _, auditLabel, err := buildAuditSink(auditLog, auditMaxBytes)
 				if err != nil {
 					return err
 				}
@@ -185,8 +186,8 @@ AI-powered analysis.`,
 					return fmt.Errorf("failed to create executor: %w", err)
 				}
 				fmt.Printf("\n  %s %s\n", ui.DimStyle.Render("Executor:"), ui.CyanStyle.Render(label))
-				fmt.Printf("  %s %s\n\n", ui.DimStyle.Render("Audit log:"), ui.CyanStyle.Render(auditLabel))
-				return runApply(final.result.decisions, exec, label)
+				fmt.Printf("  %s %s\n\n", ui.DimStyle.Render("Audit log:"), auditLabel)
+				return runApply(final.result.decisions, exec, label, sink)
 			}
 			return nil
 		},
@@ -200,6 +201,7 @@ AI-powered analysis.`,
 	cmd.Flags().BoolVar(&apply, "apply", false, "Interactively approve/reject each decision and run approved ones")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", true, "When applying, log actions without executing them")
 	cmd.Flags().StringVar(&auditLog, "audit-log", "", "Append a durable JSONL record of every executed action to this file (empty = disabled)")
+	cmd.Flags().Int64Var(&auditMaxBytes, "audit-max-bytes", 0, "Rotate the audit log when it exceeds this many bytes, keeping a few numbered backups (0 = never rotate)")
 
 	return cmd
 }

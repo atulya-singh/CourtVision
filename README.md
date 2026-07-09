@@ -219,6 +219,9 @@ Monitor multiple clusters with one subagent each plus a cross-cluster coordinato
 | `--auto-safe` | `false` | Let each worker auto-execute its own **reversible** decisions (`cordon_node`, `scale_down`, `patch_limits`); `evict_and_move` still waits for approval |
 | `--auto-cooldown` | `3m` | In auto-safe mode, suppress repeat auto-execution of the same action on the same target for this long |
 | `--audit-log` | `` (off) | Append a durable JSONL record of every executed action (all clusters) to this file |
+| `--audit-max-bytes` | `0` (unbounded) | Rotate the audit log past this size, keeping a few numbered backups |
+
+> The audit trail is also served read-only at `GET /api/audit` (fleet) and `GET /api/clusters/{cluster}/audit` (per-cluster), newest-first — live even without `--audit-log` (backed by an in-memory ring).
 
 > **Auto-safe** is the unattended tier: each worker heals its own cluster's reversible issues without a human in the loop, while the coordinator's cross-cluster moves stay advisory (surfaced read-only, no auto-execution). `--dry-run` is still the separate safety switch — `--auto-safe` with `--dry-run=false` performs **real autonomous mutations** on live clusters (the startup banner warns when both are set). The per-target cooldown stops the ~5s analysis loop from re-firing the same fix every tick.
 
@@ -322,7 +325,8 @@ Recently shipped:
 Things still on the list, roughly in priority order:
 - [ ] **Coordinator tests** — the `ClusterWorker` now has auto-safe/cooldown tests, but the `Coordinator` still has none; a test with a stub LLM over cached snapshots is the obvious next addition.
 - [ ] **Per-cluster overrides in multi-monitor** — `--namespace` and `--dry-run` apply uniformly to every cluster; a config file would let heterogeneous clusters differ.
-- [ ] **Audit log follow-ups** — the JSONL audit log (above) covers executions; still open are lifecycle events (propose/approve/reject), automatic rotation/retention, a `/api/audit` read endpoint, and tamper-evidence.
+- [x] **Audit read API + rotation + rejections** — the audit trail is now surfaced read-only at `GET /api/audit` (fleet) and `/api/clusters/{c}/audit` (per-cluster), served from a bounded in-memory ring that exists even without `--audit-log`. The JSONL file gained opt-in size-based rotation (`--audit-max-bytes`, keeping numbered backups), and the interactive review now records `rejected` events (rejections run no executor, so they'd otherwise leave no trace).
+- [ ] **Audit log follow-ups (remaining)** — still open: per-decision `proposed`/`approved` lifecycle events (deliberately not logged per analyze tick today, since decision IDs churn each tick and would flood a durable log), retention policies beyond count-based rotation, and tamper-evidence (hash chaining).
 - [ ] **Remaining autonomy** — the coordinator's cross-cluster decisions are surfaced read-only (advisory) with no execution path of their own, and there is no full-auto tier that also runs non-reversible actions (`evict_and_move`). Both are deliberately left manual for now; a CLI-driven review flow for coordinator decisions is the natural next step.
 - [ ] **Document `review` and `analyze --apply`** — the new interactive approval flows in the REPL and CLI are not yet covered in the CLI Reference above.
 

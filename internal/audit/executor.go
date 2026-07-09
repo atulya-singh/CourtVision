@@ -46,15 +46,15 @@ func NewExecutor(inner executor.Executor, sink Sink, cluster, mode string, dryRu
 func (a *AuditingExecutor) Execute(ctx context.Context, d *types.Decision) error {
 	actor := ActorFrom(ctx)
 
-	a.sink.Record(a.event(actor, d, "executing", 0, nil))
+	a.sink.Record(a.event(actor, d, PhaseExecuting, 0, nil))
 
 	start := time.Now()
 	err := a.inner.Execute(ctx, d)
 	elapsed := time.Since(start)
 
-	phase := "executed"
+	phase := PhaseExecuted
 	if err != nil {
-		phase = "failed"
+		phase = PhaseFailed
 	}
 	a.sink.Record(a.event(actor, d, phase, elapsed, err))
 
@@ -88,7 +88,7 @@ func (a *AuditingExecutor) event(actor string, d *types.Decision, phase string, 
 		Mode:        a.mode,
 	}
 	// Duration and error only make sense on the terminal event.
-	if phase != "executing" {
+	if phase != PhaseExecuting {
 		e.DurationMS = elapsed.Milliseconds()
 	}
 	if err != nil {

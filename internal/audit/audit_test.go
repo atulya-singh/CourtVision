@@ -37,7 +37,7 @@ func readLines(t *testing.T, path string) []string {
 
 func TestFileSink_WritesOneJSONLinePerRecord(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "audit.jsonl")
-	sink, err := NewFileSink(path, false)
+	sink, err := NewFileSink(path, false, 0, 0)
 	if err != nil {
 		t.Fatalf("NewFileSink: %v", err)
 	}
@@ -67,7 +67,7 @@ func TestFileSink_WritesOneJSONLinePerRecord(t *testing.T) {
 func TestFileSink_AppendsAcrossReopen(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "audit.jsonl")
 
-	first, err := NewFileSink(path, false)
+	first, err := NewFileSink(path, false, 0, 0)
 	if err != nil {
 		t.Fatalf("NewFileSink: %v", err)
 	}
@@ -76,7 +76,7 @@ func TestFileSink_AppendsAcrossReopen(t *testing.T) {
 
 	// Re-opening the same path must extend the log, not truncate it — a restart
 	// should never lose earlier records.
-	second, err := NewFileSink(path, false)
+	second, err := NewFileSink(path, false, 0, 0)
 	if err != nil {
 		t.Fatalf("reopen NewFileSink: %v", err)
 	}
@@ -90,7 +90,7 @@ func TestFileSink_AppendsAcrossReopen(t *testing.T) {
 
 func TestFileSink_ConcurrentRecordsAreWellFormed(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "audit.jsonl")
-	sink, err := NewFileSink(path, false)
+	sink, err := NewFileSink(path, false, 0, 0)
 	if err != nil {
 		t.Fatalf("NewFileSink: %v", err)
 	}

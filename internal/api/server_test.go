@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/atulya-singh/CourtVision/internal/audit"
 	"github.com/atulya-singh/CourtVision/internal/store"
 	"github.com/atulya-singh/CourtVision/internal/types"
 )
@@ -187,6 +188,54 @@ func TestMutationRoutesRemoved(t *testing.T) {
 
 	if d := st.GetDecisions()[0]; d.Executed || d.Status == types.StatusExecuted {
 		t.Error("a decision must not be executable through the HTTP API anymore")
+	}
+}
+
+// ── /api/audit (read-only) ────────────────────────────────────────────────────
+
+// TestHandleAudit_ServesTrail proves the audit read endpoint returns the shared
+// ring newest-first and stays GET-only.
+func TestHandleAudit_ServesTrail(t *testing.T) {
+	mem := audit.NewMemorySink(10)
+	mem.Record(audit.Event{DecisionID: "1", Cluster: "a", Phase: audit.PhaseExecuting})
+	mem.Record(audit.Event{DecisionID: "2", Cluster: "a", Phase: audit.PhaseExecuted})
+
+	srv := &Server{store: store.New(), audit: mem, port: "0"}
+	handler := srv.routes()
+
+	req := httptest.NewRequest(http.MethodGet, "/api/audit", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d", w.Code)
+	}
+	var got []audit.Event
+	if err := json.NewDecoder(w.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(got) != 2 || got[0].DecisionID != "2" {
+		t.Errorf("want 2 events newest-first, got %+v", got)
+	}
+
+	// POST is rejected: the audit trail is read-only like the rest of the API.
+	req = httptest.NewRequest(http.MethodPost, "/api/audit", nil)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Errorf("POST /api/audit: want 405, got %d", w.Code)
+	}
+}
+
+// TestHandleAudit_AbsentWhenNoReader confirms single-cluster/observe-only servers
+// (no audit reader) don't expose the route at all.
+func TestHandleAudit_AbsentWhenNoReader(t *testing.T) {
+	srv := NewServer(store.New(), "0")
+	req := httptest.NewRequest(http.MethodGet, "/api/audit", nil)
+	w := httptest.NewRecorder()
+	srv.routes().ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Errorf("audit route should be absent without a reader, got %d", w.Code)
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/atulya-singh/CourtVision/internal/audit"
 	"github.com/atulya-singh/CourtVision/internal/cluster"
 	"github.com/atulya-singh/CourtVision/internal/store"
 )
@@ -33,6 +34,7 @@ type Server struct {
 	store   *store.Store
 	workers map[string]*cluster.ClusterWorker
 	order   []string // stable cluster ordering for listing
+	audit   audit.Reader
 	port    string
 }
 
@@ -42,15 +44,16 @@ func NewServer(st *store.Store, port string) *Server {
 
 // NewMultiServer builds the API for a multi-cluster deployment. masterStore
 // holds the coordinator's cross-cluster decisions; workers expose each cluster's
-// own store for read-only inspection.
-func NewMultiServer(workers []*cluster.ClusterWorker, masterStore *store.Store, port string) *Server {
+// own store for read-only inspection. auditReader (may be nil) backs the
+// read-only /api/audit endpoints from the shared audit ring.
+func NewMultiServer(workers []*cluster.ClusterWorker, masterStore *store.Store, auditReader audit.Reader, port string) *Server {
 	m := make(map[string]*cluster.ClusterWorker, len(workers))
 	order := make([]string, 0, len(workers))
 	for _, w := range workers {
 		m[w.Name()] = w
 		order = append(order, w.Name())
 	}
-	return &Server{store: masterStore, workers: m, order: order, port: port}
+	return &Server{store: masterStore, workers: m, order: order, audit: auditReader, port: port}
 }
 
 // routes builds the full handler tree (wrapped in CORS). It is separated from
@@ -74,6 +77,12 @@ func (s *Server) routes() http.Handler {
 	if s.workers != nil {
 		mux.HandleFunc("/api/clusters", s.handleClustersList)
 		mux.HandleFunc("/api/clusters/", s.handleClusterScoped)
+	}
+
+	// The audit trail is only served when an in-memory reader is wired in
+	// (multi-monitor). Single-cluster monitor is observe-only and audits nothing.
+	if s.audit != nil {
+		mux.HandleFunc("/api/audit", s.handleAudit)
 	}
 
 	return corsMiddleware(mux)
@@ -113,6 +122,16 @@ func (s *Server) handleDecisions(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 	streamSSE(w, r, s.store)
+}
+
+// handleAudit serves GET /api/audit — the fleet-wide audit trail (every
+// recorded execution and lifecycle event), newest first, read-only.
+func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, s.audit.Snapshot())
 }
 
 // renderSnapshot writes a store's current snapshot as JSON.
@@ -226,6 +245,7 @@ func (s *Server) handleClustersList(w http.ResponseWriter, r *http.Request) {
 //	GET /api/clusters/{cluster}/snapshot
 //	GET /api/clusters/{cluster}/decisions
 //	GET /api/clusters/{cluster}/events
+//	GET /api/clusters/{cluster}/audit
 func (s *Server) handleClusterScoped(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/api/clusters/")
 	parts := strings.Split(path, "/")
@@ -248,6 +268,12 @@ func (s *Server) handleClusterScoped(w http.ResponseWriter, r *http.Request) {
 		streamSSE(w, r, st)
 	case parts[1] == "decisions" && len(parts) == 2:
 		renderDecisions(w, r, st)
+	case parts[1] == "audit" && len(parts) == 2 && s.audit != nil:
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		writeJSON(w, s.audit.SnapshotForCluster(parts[0]))
 	default:
 		http.Error(w, "not found", http.StatusNotFound)
 	}
