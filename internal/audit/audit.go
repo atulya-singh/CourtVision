@@ -142,12 +142,11 @@ func (s *FileSink) Record(e Event) {
 	data = append(data, '\n') // JSONL: one object per line
 
 	// Rotate before writing so no single line straddles two files. Only rotate a
-	// non-empty file, so a lone oversized record still lands somewhere.
+	// non-empty file, so a lone oversized record still lands somewhere. A rotation
+	// error is intentionally ignored — best-effort auditing keeps writing to the
+	// current file rather than dropping the record.
 	if s.maxBytes > 0 && s.size > 0 && s.size+int64(len(data)) > s.maxBytes {
-		if err := s.rotate(); err != nil {
-			// Rotation failed (e.g. rename error): keep writing to the current file
-			// rather than losing the record.
-		}
+		_ = s.rotate()
 	}
 
 	n, err := s.f.Write(data)
