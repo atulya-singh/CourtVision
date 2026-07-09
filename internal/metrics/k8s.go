@@ -16,6 +16,18 @@ import (
 	"path/filepath"
 )
 
+const (
+	// snapshotTimeout bounds a full metrics collection. Without it the collect
+	// loop uses context.Background() and a slow or unreachable API server can
+	// hang the pipeline indefinitely; with it a stuck request fails fast and the
+	// loop recovers on the next tick.
+	snapshotTimeout = 30 * time.Second
+	// listPageSize caps how many objects we pull per API request so a very large
+	// cluster can't force one giant unbounded response into memory. The apiserver
+	// returns a Continue token that we follow until the full set is drained.
+	listPageSize = 500
+)
+
 type K8sProvider struct {
 	coreClient    kubernetes.Interface
 	metricsClient metricsv.Interface
@@ -75,24 +87,28 @@ func NewK8sProvider(namespace, contextName string) (*K8sProvider, error) {
 }
 
 func (k *K8sProvider) GetClusterSnapshot() (*types.ClusterSnapshot, error) {
-	ctx := context.Background()
+	// Bound the whole collection: a slow or unreachable API server must not hang
+	// the collect loop forever. All the List calls below share this deadline.
+	ctx, cancel := context.WithTimeout(context.Background(), snapshotTimeout)
+	defer cancel()
 	now := time.Now()
 
-	// List all nodes
-
-	nodeList, err := k.coreClient.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	// List all nodes (paginated: bounded memory per request on large clusters).
+	nodeItems, err := listAllNodes(ctx, k.coreClient)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list nodes: %w", err)
 	}
 
-	// List all pods
-	podList, err := k.coreClient.CoreV1().Pods(k.namespace).List(ctx, metav1.ListOptions{})
+	// List all pods (paginated).
+	podItems, err := listAllPods(ctx, k.coreClient, k.namespace)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list pods: %w", err)
 	}
 
 	// Get node metrics
-	// returns the actual CPU and memory being used right now on each node
+	// returns the actual CPU and memory being used right now on each node.
+	// metrics-server doesn't honor Continue tokens, so these two stay single
+	// calls — but still under the bounded context above.
 	nodeMetricsList, err := k.metricsClient.MetricsV1beta1().NodeMetricses().List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get node metrics (is metrics-server running ?): %w", err)
@@ -133,11 +149,11 @@ func (k *K8sProvider) GetClusterSnapshot() (*types.ClusterSnapshot, error) {
 
 	// Counting total number of pods on each node
 	podCountPerNode := make(map[string]int)
-	for _, pod := range podList.Items {
+	for _, pod := range podItems {
 		podCountPerNode[pod.Spec.NodeName]++
 	}
 
-	for _, node := range nodeList.Items {
+	for _, node := range nodeItems {
 		cpuCapacity := float64(node.Status.Allocatable.Cpu().MilliValue())
 		memCapacity := float64(node.Status.Allocatable.Memory().Value()) / (1024 * 1024)
 
@@ -165,7 +181,7 @@ func (k *K8sProvider) GetClusterSnapshot() (*types.ClusterSnapshot, error) {
 		snapshot.Nodes = append(snapshot.Nodes, nm)
 	}
 
-	for _, pod := range podList.Items {
+	for _, pod := range podItems {
 		if pod.Status.Phase != corev1.PodRunning {
 			continue
 		}
@@ -211,4 +227,41 @@ func (k *K8sProvider) GetClusterSnapshot() (*types.ClusterSnapshot, error) {
 	}
 
 	return snapshot, nil
+}
+
+// listAllNodes pages through every node, following the apiserver's Continue
+// token so a large cluster is fetched in bounded chunks rather than one
+// unbounded response.
+func listAllNodes(ctx context.Context, client kubernetes.Interface) ([]corev1.Node, error) {
+	var nodes []corev1.Node
+	opts := metav1.ListOptions{Limit: listPageSize}
+	for {
+		page, err := client.CoreV1().Nodes().List(ctx, opts)
+		if err != nil {
+			return nil, err
+		}
+		nodes = append(nodes, page.Items...)
+		if page.Continue == "" {
+			return nodes, nil
+		}
+		opts.Continue = page.Continue
+	}
+}
+
+// listAllPods pages through every pod in the namespace, following the Continue
+// token the same way as listAllNodes.
+func listAllPods(ctx context.Context, client kubernetes.Interface, namespace string) ([]corev1.Pod, error) {
+	var pods []corev1.Pod
+	opts := metav1.ListOptions{Limit: listPageSize}
+	for {
+		page, err := client.CoreV1().Pods(namespace).List(ctx, opts)
+		if err != nil {
+			return nil, err
+		}
+		pods = append(pods, page.Items...)
+		if page.Continue == "" {
+			return pods, nil
+		}
+		opts.Continue = page.Continue
+	}
 }
