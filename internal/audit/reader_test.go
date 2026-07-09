@@ -105,6 +105,82 @@ func TestLifecycle_CarriesDecisionFieldsNoExecFields(t *testing.T) {
 	}
 }
 
+// ── tamper-evidence (hash chaining) ───────────────────────────────────────────
+
+// collectSink captures the exact events a HashingSink forwards, in order.
+type collectSink struct{ events []Event }
+
+func (c *collectSink) Record(e Event) { c.events = append(c.events, e) }
+func (c *collectSink) Close() error   { return nil }
+
+func TestHashingSink_ProducesVerifiableChain(t *testing.T) {
+	inner := &collectSink{}
+	h := NewHashingSink(inner)
+	for i := 0; i < 5; i++ {
+		h.Record(ev("id", "c", PhaseExecuted))
+	}
+
+	if len(inner.events) != 5 {
+		t.Fatalf("want 5 forwarded events, got %d", len(inner.events))
+	}
+	// First event links to the empty hash; each subsequent prev_hash equals the
+	// prior hash; every hash is non-empty.
+	if inner.events[0].PrevHash != "" {
+		t.Errorf("first event should link to empty prev_hash, got %q", inner.events[0].PrevHash)
+	}
+	for i, e := range inner.events {
+		if e.Hash == "" {
+			t.Errorf("event %d has no hash", i)
+		}
+		if i > 0 && e.PrevHash != inner.events[i-1].Hash {
+			t.Errorf("event %d prev_hash does not chain to previous hash", i)
+		}
+	}
+	if err := VerifyChain(inner.events); err != nil {
+		t.Errorf("freshly chained events should verify, got %v", err)
+	}
+}
+
+func TestVerifyChain_DetectsContentTampering(t *testing.T) {
+	inner := &collectSink{}
+	h := NewHashingSink(inner)
+	h.Record(ev("1", "c", PhaseExecuting))
+	h.Record(ev("2", "c", PhaseExecuted))
+	h.Record(ev("3", "c", PhaseExecuted))
+
+	// Someone edits a recorded event's content but leaves its hash in place.
+	inner.events[1].TargetPod = "backdoor"
+
+	if err := VerifyChain(inner.events); err == nil {
+		t.Error("editing an event's content should break verification")
+	}
+}
+
+func TestVerifyChain_DetectsDroppedEvent(t *testing.T) {
+	inner := &collectSink{}
+	h := NewHashingSink(inner)
+	h.Record(ev("1", "c", PhaseExecuting))
+	h.Record(ev("2", "c", PhaseExecuted))
+	h.Record(ev("3", "c", PhaseExecuted))
+
+	// Drop the middle event — the chain's prev_hash links no longer line up.
+	tampered := []Event{inner.events[0], inner.events[2]}
+	if err := VerifyChain(tampered); err == nil {
+		t.Error("removing an event should break the chain")
+	}
+}
+
+func TestVerifyChain_EmptyAndSingle(t *testing.T) {
+	if err := VerifyChain(nil); err != nil {
+		t.Errorf("empty chain should verify vacuously, got %v", err)
+	}
+	inner := &collectSink{}
+	NewHashingSink(inner).Record(ev("1", "c", PhaseProposed))
+	if err := VerifyChain(inner.events); err != nil {
+		t.Errorf("single-event chain should verify, got %v", err)
+	}
+}
+
 // TestFileSink_Rotates verifies size-based rotation: once a write would push the
 // file past maxBytes a fresh file starts, the previous one is preserved as a
 // numbered backup, no file exceeds the cap (records are smaller than it), and no

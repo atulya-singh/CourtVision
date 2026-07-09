@@ -18,6 +18,8 @@ package audit
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -62,6 +64,13 @@ type Event struct {
 	Mode        string           `json:"mode"`           // the safety-switch label: dry-run | mock | live
 	DurationMS  int64            `json:"duration_ms,omitempty"` // wall time of the execute call (terminal events only)
 	Error       string           `json:"error,omitempty"`
+
+	// Tamper-evidence: when a HashingSink is in the chain, PrevHash links to the
+	// previous event's Hash and Hash is sha256 over this event (with Hash cleared).
+	// A break or edit anywhere in the sequence fails VerifyChain. Empty when
+	// hashing is not wired in.
+	PrevHash string `json:"prev_hash,omitempty"`
+	Hash     string `json:"hash,omitempty"`
 }
 
 // Sink is an append-only audit destination. Implementations must be safe for
@@ -308,6 +317,73 @@ func Lifecycle(actor, phase, cluster string, d *types.Decision) Event {
 		Reasoning:  d.Reasoning,
 		Phase:      phase,
 	}
+}
+
+// HashingSink makes the audit trail tamper-evident by chaining events: it stamps
+// each event with the previous event's hash (PrevHash) and this event's own hash
+// (sha256 over the event with Hash cleared), then forwards it to the inner sink.
+// Editing, reordering, or dropping any event breaks the chain, which VerifyChain
+// detects.
+//
+// It is wrapped OUTERMOST (over the file+memory fan-out) and holds its mutex
+// across the forward, so the total order it assigns is exactly the order the
+// inner sinks see — the chain and the stored sequence never disagree, even when
+// many workers record concurrently.
+type HashingSink struct {
+	mu       sync.Mutex
+	inner    Sink
+	lastHash string
+}
+
+// NewHashingSink wraps inner so every recorded event is hash-chained.
+func NewHashingSink(inner Sink) *HashingSink {
+	if inner == nil {
+		inner = NewNopSink()
+	}
+	return &HashingSink{inner: inner}
+}
+
+func (h *HashingSink) Record(e Event) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	e.PrevHash = h.lastHash
+	e.Hash = hashEvent(e)
+	h.lastHash = e.Hash
+	h.inner.Record(e)
+}
+
+func (h *HashingSink) Close() error { return h.inner.Close() }
+
+// hashEvent returns the hex sha256 of e with its Hash field cleared (so the hash
+// never covers itself) but PrevHash included (so the chain links). Marshaling is
+// deterministic for a fixed struct field order, which is what we rely on.
+func hashEvent(e Event) string {
+	e.Hash = ""
+	b, err := json.Marshal(e)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// VerifyChain checks a hash-chained sequence given in chronological (oldest-first)
+// order. It returns an error identifying the first event whose content was
+// altered (hash mismatch) or whose link was broken (prev_hash mismatch, i.e. an
+// event was reordered or removed). A sequence with no hashes verifies vacuously,
+// so callers should confirm hashing was enabled separately if they require it.
+func VerifyChain(events []Event) error {
+	prev := ""
+	for i, e := range events {
+		if e.PrevHash != prev {
+			return fmt.Errorf("event %d (decision %s): chain broken — prev_hash %q, expected %q", i, e.DecisionID, e.PrevHash, prev)
+		}
+		if want := hashEvent(e); want != e.Hash {
+			return fmt.Errorf("event %d (decision %s): content tampered — hash %q, recomputed %q", i, e.DecisionID, e.Hash, want)
+		}
+		prev = e.Hash
+	}
+	return nil
 }
 
 // actorKey is the unexported context key under which the triggering actor is

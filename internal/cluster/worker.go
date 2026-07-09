@@ -18,6 +18,10 @@ import (
 	"github.com/atulya-singh/CourtVision/internal/types"
 )
 
+// actorProposer tags "proposed" audit events — the analysis loop that surfaced
+// the decision, distinct from the actor that later executes or rejects it.
+const actorProposer = "worker-analysis"
+
 // ClusterWorker is a subagent responsible for exactly one cluster. It runs the
 // same collect → analyze → store pipeline the single-cluster monitor uses, and
 // additionally caches its most recent snapshot so the Coordinator can read the
@@ -28,15 +32,18 @@ type ClusterWorker struct {
 	provider metrics.Provider
 	engine   decision.Engine
 	exec     executor.Executor
+	sink     audit.Sink // records "proposed" lifecycle events (executions are audited inside exec)
 
 	// auto-safe mode: when auto is set, the worker executes its own reversible
 	// decisions instead of leaving them pending. cooldown throttles repeat
 	// executions of the same action on the same target, and lastAuto records the
-	// last time each target was auto-executed. lastAuto is touched only from the
-	// single analyze goroutine, so it needs no lock.
-	auto     bool
-	cooldown time.Duration
-	lastAuto map[string]time.Time
+	// last time each target was auto-executed. lastProposed does the same for the
+	// durable "proposed" record. Both maps are touched only from the single
+	// analyze goroutine, so they need no lock.
+	auto         bool
+	cooldown     time.Duration
+	lastAuto     map[string]time.Time
+	lastProposed map[string]time.Time
 
 	mu     sync.RWMutex
 	latest *types.ClusterSnapshot
@@ -47,16 +54,21 @@ type ClusterWorker struct {
 // so approved actions land on the right cluster. When auto is true the worker
 // auto-executes its reversible decisions (see autoExecute), throttled by
 // cooldown per target.
-func NewClusterWorker(name string, provider metrics.Provider, engine decision.Engine, exec executor.Executor, auto bool, cooldown time.Duration) *ClusterWorker {
+func NewClusterWorker(name string, provider metrics.Provider, engine decision.Engine, exec executor.Executor, auto bool, cooldown time.Duration, sink audit.Sink) *ClusterWorker {
+	if sink == nil {
+		sink = audit.NewNopSink()
+	}
 	return &ClusterWorker{
-		name:     name,
-		store:    store.New(),
-		provider: provider,
-		engine:   engine,
-		exec:     exec,
-		auto:     auto,
-		cooldown: cooldown,
-		lastAuto: make(map[string]time.Time),
+		name:         name,
+		store:        store.New(),
+		provider:     provider,
+		engine:       engine,
+		exec:         exec,
+		sink:         sink,
+		auto:         auto,
+		cooldown:     cooldown,
+		lastAuto:     make(map[string]time.Time),
+		lastProposed: make(map[string]time.Time),
 	}
 }
 
@@ -141,11 +153,16 @@ func (w *ClusterWorker) analyze(ctx context.Context, ch <-chan *types.ClusterSna
 // approval, and repeats within the cooldown window are skipped.
 func (w *ClusterWorker) processDecisions(decisions []types.Decision) {
 	recordDecisions(w.store, decisions)
-	if !w.auto {
-		return
-	}
 	for _, d := range decisions {
-		if d.Action == types.ActionNone || !d.Action.IsReversible() {
+		if d.Action == types.ActionNone {
+			continue
+		}
+		// Durably record the proposal (deduped) regardless of auto-safe — this is
+		// the only audit trace a non-reversible decision that stays pending forever
+		// ever gets.
+		w.logProposed(d)
+
+		if !w.auto || !d.Action.IsReversible() {
 			continue
 		}
 		if w.onCooldown(d) {
@@ -154,6 +171,20 @@ func (w *ClusterWorker) processDecisions(decisions []types.Decision) {
 		}
 		w.autoExecute(d)
 	}
+}
+
+// logProposed records a "proposed" audit event for an actionable decision,
+// deduplicated by problem signature within the cooldown window. The engine
+// re-proposes the same problems every tick with fresh IDs, so without this the
+// durable log would balloon; here a given problem is logged at most once per
+// window — the same cadence at which the worker would act on it.
+func (w *ClusterWorker) logProposed(d types.Decision) {
+	key := cooldownKey(d)
+	if last, ok := w.lastProposed[key]; ok && time.Since(last) < w.cooldown {
+		return
+	}
+	w.lastProposed[key] = time.Now()
+	w.sink.Record(audit.Lifecycle(actorProposer, audit.PhaseProposed, w.name, &d))
 }
 
 // autoExecute runs a single reversible decision against the worker's own cluster

@@ -237,6 +237,10 @@ Run a one-shot cluster analysis and exit.
 | `--ollama-url` | `http://localhost:11434` | Ollama server URL |
 | `--model` | `llama3` | LLM model name |
 
+### `courtvision audit-verify <file>`
+
+Verify the tamper-evidence hash chain of a JSONL audit log written with `--audit-log`. Reports the first event whose content was altered or whose link was broken (edited, reordered, or removed), or confirms the chain is intact. Exits non-zero on tampering, so it drops into a cron/CI check. Verify a single unrotated file — each rotated segment (`<file>.1`, `.2`, …) carries its own independent chain.
+
 ### `courtvision status`
 
 Check connectivity to Ollama and Kubernetes.
@@ -323,10 +327,11 @@ Recently shipped:
 - [x] **Multi-cluster dashboard** — the React dashboard is now fleet-aware. It probes `GET /api/clusters` on load (404 → single-cluster view over the classic `/api/*` routes; 200 → a Fleet tab plus one tab per worker). Cluster tabs read that worker's own `/api/clusters/{cluster}/{snapshot,decisions,events}`; the Fleet view shows a clickable per-cluster roll-up alongside the coordinator's cross-cluster (advisory) decisions.
 
 Things still on the list, roughly in priority order:
-- [ ] **Coordinator tests** — the `ClusterWorker` now has auto-safe/cooldown tests, but the `Coordinator` still has none; a test with a stub LLM over cached snapshots is the obvious next addition.
+- [x] **Coordinator tests** — `coordinator_test.go` drives `tick` with a stub `Generatable` over cached snapshots: records cross-cluster decisions as pending, enforces the ≥2-cluster guard (LLM not consulted below it), skips cold/nil snapshots, and stays safe on LLM/non-JSON responses.
 - [ ] **Per-cluster overrides in multi-monitor** — `--namespace` and `--dry-run` apply uniformly to every cluster; a config file would let heterogeneous clusters differ.
 - [x] **Audit read API + rotation + rejections** — the audit trail is now surfaced read-only at `GET /api/audit` (fleet) and `/api/clusters/{c}/audit` (per-cluster), served from a bounded in-memory ring that exists even without `--audit-log`. The JSONL file gained opt-in size-based rotation (`--audit-max-bytes`, keeping numbered backups), and the interactive review now records `rejected` events (rejections run no executor, so they'd otherwise leave no trace).
-- [ ] **Audit log follow-ups (remaining)** — still open: per-decision `proposed`/`approved` lifecycle events (deliberately not logged per analyze tick today, since decision IDs churn each tick and would flood a durable log), retention policies beyond count-based rotation, and tamper-evidence (hash chaining).
+- [x] **Lifecycle events + tamper-evidence** — the audit trail now records `proposed` (worker analysis, **deduped by problem signature within the cooldown window** so per-tick re-analysis can't flood the log — a non-reversible decision that sits pending forever finally gets a durable trace) and `approved`/`rejected` (interactive gates), alongside the execution events. The whole stream is **hash-chained** (sha256 `prev_hash`+`hash` per event); `courtvision audit-verify <file>` recomputes the chain and flags the first tampered or dropped event.
+- [ ] **Audit log follow-ups (remaining)** — still open: auditing the coordinator's cross-cluster proposals (currently advisory-only, unaudited), time/space retention policies beyond count-based rotation, and a signed/anchored chain root (the hash chain proves internal consistency but a holder of the file could recompute a fully-rewritten chain).
 - [ ] **Remaining autonomy** — the coordinator's cross-cluster decisions are surfaced read-only (advisory) with no execution path of their own, and there is no full-auto tier that also runs non-reversible actions (`evict_and_move`). Both are deliberately left manual for now; a CLI-driven review flow for coordinator decisions is the natural next step.
 - [ ] **Document `review` and `analyze --apply`** — the new interactive approval flows in the REPL and CLI are not yet covered in the CLI Reference above.
 

@@ -82,16 +82,20 @@ React/TS dashboard.
 truth (cordon/scale_down/patch_limits = true). Used by both the interactive
 auto-accept and worker auto-safe.
 
-**Audit trail:** every *execution* — `executing` → `executed`/`failed` — plus the
-interactive `rejected` gate is recorded, tagged with the actor
-(`auto-safe`/`interactive-review`), cluster, action, target, reasoning, mode,
-duration, and error. Implemented as an `AuditingExecutor` decorator wrapping the
-safety-switch executor (a single chokepoint over every mutating path). Records
-always land in an in-memory ring (`MemorySink`), surfaced read-only at
-**`/api/audit`** + `/api/clusters/{c}/audit` in multi-monitor; `--audit-log <file>`
-(opt-in, on `multi-monitor`/`analyze`) *also* persists them as durable JSONL, with
-optional size-based rotation (`--audit-max-bytes`). Proposals aren't logged
-per-tick (IDs churn each tick — would flood the durable log); see `internal/audit/`.
+**Audit trail:** the full lifecycle is recorded — `proposed` (worker analysis,
+**deduped by problem signature within the cooldown window** so per-tick re-analysis
+with churning IDs can't flood the log), `approved`/`rejected` (interactive review
+gates), and `executing` → `executed`/`failed` (executions, via the
+`AuditingExecutor` decorator over the safety-switch executor). Each event is
+tagged with the actor (`worker-analysis`/`interactive-review`/`auto-safe`),
+cluster, action, target, reasoning, mode, duration, and error. Records always land
+in an in-memory ring (`MemorySink`), surfaced read-only at **`/api/audit`** +
+`/api/clusters/{c}/audit` in multi-monitor; `--audit-log <file>` (opt-in, on
+`multi-monitor`/`analyze`) *also* persists them as durable JSONL, with optional
+size-based rotation (`--audit-max-bytes`). The whole stream is **hash-chained**
+(`HashingSink`, sha256 `prev_hash`+`hash` per event) so tampering is detectable
+via `audit.VerifyChain` / the `courtvision audit-verify <file>` command. Coordinator
+(cross-cluster) proposals are advisory and not yet audited. See `internal/audit/`.
 
 ---
 
@@ -106,6 +110,7 @@ per-tick (IDs churn each tick — would flood the durable log); see `internal/au
 - `apply.go` — `applyModel`: standalone Bubbletea review screen for `analyze --apply`. Has the Tab auto-accept toggle + `autoAdvance`. **Can run LIVE.**
 - `repl.go` — interactive REPL; `review` runs the inline approval flow (sandboxed: mock→mock, k8s→dry-run). Mirrors `apply.go`'s auto-accept.
 - `status.go` — `status` subcommand (Ollama/K8s connectivity check).
+- `audit_verify.go` — `audit-verify <file>` subcommand: parses a JSONL audit log and runs `audit.VerifyChain`, reporting the first tampered/dropped event (non-zero exit) or confirming the chain is intact.
 - `*_test.go` — review-flow + auto-accept Update-loop tests.
 
 ### `internal/types/` — shared data model
@@ -130,13 +135,13 @@ per-tick (IDs churn each tick — would flood the durable log); see `internal/au
 - `k8s.go` — `K8sExecutor`: real mutations. `patchLimits` distributes the pod-level target across containers proportionally (`distribute`/`setContainerLimits` helpers); `owningWorkload` resolves the pod's **top-level controller** (`controllerOf` prefers the `Controller:true` owner ref) — Pod→ReplicaSet→Deployment, or a StatefulSet/DaemonSet owning its pods directly, or a bare ReplicaSet. `patch_limits` supports Deployment/StatefulSet/DaemonSet/ReplicaSet; `scale_down` supports Deployment/StatefulSet/ReplicaSet (DaemonSet rejected — no replica count) via `decrementedReplicas`; CRD-owned workloads (e.g. Argo Rollout) and bare pods fail with a clear `unsupportedWorkload` error. `evict` submits a PDB-respecting Eviction (policy/v1); when `target_node` is set, `evaluateMoveTarget` validates it first (`nodeReady` helper) — refuses a missing/cordoned/NotReady node and no-ops when the pod is already there — but does not force scheduler placement. `patch_limits`/`scale_down`/`cordon_node` run under `retry.RetryOnConflict` (Get→mutate→Update refetches per attempt), so a concurrent modification 409 is retried instead of failing; non-conflict errors return immediately. `evict` submits an Eviction (policy/v1) via `EvictV1`, not a raw Delete, so it honors PodDisruptionBudgets: 429 (PDB block) → clear wrapped error (never falls back to Delete), 404 (already gone) → no-op success.
 
 ### `internal/audit/` — durable, append-only record of every execution + lifecycle
-- `audit.go` — `Event` schema (with `Phase*` consts), `Sink` interface, `NopSink` (audit off), `FileSink` (JSONL, mutex + `O_APPEND`, optional fsync, **size-based rotation** when `maxBytes>0` keeping `backups` numbered files via `rotate`), `MultiSink`. `MemorySink` is a **bounded ring that is both a `Sink` and a `Reader`** (`Snapshot`/`SnapshotForCluster`, newest-first) — it backs the read API and works even without a file. `Lifecycle(actor,phase,cluster,d)` builds a non-execution event (no mode/duration). `WithActor`/`ActorFrom` carry the triggering actor on the context.
+- `audit.go` — `Event` schema (with `Phase*` consts + `PrevHash`/`Hash`), `Sink` interface, `NopSink` (audit off), `FileSink` (JSONL, mutex + `O_APPEND`, optional fsync, **size-based rotation** when `maxBytes>0` keeping `backups` numbered files via `rotate`), `MultiSink`. `MemorySink` is a **bounded ring that is both a `Sink` and a `Reader`** (`Snapshot`/`SnapshotForCluster`, newest-first) — it backs the read API and works even without a file. `HashingSink` wraps the fan-out outermost and **hash-chains** every event (`prev_hash`+`hash`, serialized order == stored order); `VerifyChain([]Event)` recomputes the chain and reports the first tampered/dropped event. `Lifecycle(actor,phase,cluster,d)` builds a non-execution event (no mode/duration). `WithActor`/`ActorFrom` carry the triggering actor on the context.
 - `executor.go` — `AuditingExecutor`: decorates any `executor.Executor`, records `executing` → `executed`/`failed` around each `Execute`, and **returns the inner error unchanged**. Wrapped once at construction inside `buildExecutor`/`buildClusterExecutor`, so it captures both execution paths (auto-safe, interactive review). `audit` imports `executor`, never the reverse — no cycle.
 - **Wiring**: `buildAuditSink(path, maxBytes)` always builds a `MemorySink` (so `/api/audit` is live even with no `--audit-log`) and, when a path is set, fans out to a rotating `FileSink` too via `MultiSink`; it returns the reader the API serves. `--audit-log`/`--audit-max-bytes` on `multi-monitor`/`analyze` (not `monitor`, which is observe-only). **Lifecycle coverage:** the interactive review emits a `rejected` event (rejections run no executor, so they'd otherwise leave no record); `proposed` is deliberately **not** emitted per analyze tick — decision IDs churn every tick, so it would flood a durable log (proposals live in the volatile store/SSE).
 
 ### `internal/cluster/` — multi-agent topology
-- `worker.go` — `ClusterWorker` (subagent): fast collection loop + separate analyze goroutine; caches latest snapshot for the coordinator; **auto-safe** auto-execution (`processDecisions` / `autoExecute`) + per-target cooldown.
-- `coordinator.go` — `Coordinator` (master): slow loop reading workers' cached snapshots, LLM cross-cluster reasoning, single-flight `busy` guard; decisions stay pending (advisory — no execution path).
+- `worker.go` — `ClusterWorker` (subagent): fast collection loop + separate analyze goroutine; caches latest snapshot for the coordinator; **auto-safe** auto-execution (`processDecisions` / `autoExecute`) + per-target cooldown; emits deduped `proposed` audit events (`logProposed`, keyed by `cooldownKey`, throttled by `lastProposed`).
+- `coordinator.go` — `Coordinator` (master): slow loop reading workers' cached snapshots, LLM cross-cluster reasoning, single-flight `busy` guard; decisions stay pending (advisory — no execution path). `coordinator_test.go` drives `tick` with a stub `Generatable`.
 - `analysis.go` — shared helpers: `offerLatest` (drop-latest snapshot hand-off) + `recordDecisions` (stamp status + store).
 
 ### `internal/api/` — **read-only** HTTP API + SSE

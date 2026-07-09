@@ -141,7 +141,7 @@ cross-cluster decisions under /api/decisions.`,
 					return fmt.Errorf("cluster %q: %w", name, err)
 				}
 
-				workers = append(workers, cluster.NewClusterWorker(name, provider, engine, exec, autoSafe, autoCooldown))
+				workers = append(workers, cluster.NewClusterWorker(name, provider, engine, exec, autoSafe, autoCooldown, sink))
 				styledLog("Worker ready for cluster %s", ui.CyanStyle.Render(name))
 			}
 

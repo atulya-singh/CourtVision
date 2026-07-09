@@ -30,14 +30,14 @@ func (c *capturingSink) snapshot() []audit.Event {
 	return out
 }
 
-// auditedWorker builds an auto-safe worker whose executor is audited to sink,
-// exactly as the multi-monitor wiring does.
+// auditedWorker builds an auto-safe worker whose executor and proposals are both
+// audited to sink, exactly as the multi-monitor wiring does (one shared sink).
 func auditedWorker(name string, inner *recordingExecutor, sink audit.Sink) *ClusterWorker {
 	exec := audit.NewExecutor(inner, sink, name, "mock", false)
-	return NewClusterWorker(name, nil, nil, exec, true, time.Minute)
+	return NewClusterWorker(name, nil, nil, exec, true, time.Minute, sink)
 }
 
-func TestWorker_AutoSafe_AuditsExecution(t *testing.T) {
+func TestWorker_AutoSafe_AuditsProposalThenExecution(t *testing.T) {
 	sink := &capturingSink{}
 	rec := &recordingExecutor{}
 	w := auditedWorker("prod-us", rec, sink)
@@ -45,32 +45,57 @@ func TestWorker_AutoSafe_AuditsExecution(t *testing.T) {
 	w.processDecisions([]types.Decision{mkDecision("1", types.ActionScaleDown)})
 
 	events := sink.snapshot()
-	if len(events) != 2 {
-		t.Fatalf("auto-safe execution should audit executing+terminal, got %d events", len(events))
+	if len(events) != 3 {
+		t.Fatalf("reversible auto-safe should audit proposed+executing+executed, got %d events", len(events))
 	}
-	if events[0].Phase != "executing" || events[1].Phase != "executed" {
-		t.Errorf("unexpected phases: %q then %q", events[0].Phase, events[1].Phase)
+	if events[0].Phase != audit.PhaseProposed || events[1].Phase != audit.PhaseExecuting || events[2].Phase != audit.PhaseExecuted {
+		t.Errorf("unexpected phases: %q, %q, %q", events[0].Phase, events[1].Phase, events[2].Phase)
+	}
+	if events[0].Actor != actorProposer {
+		t.Errorf("proposed event should carry the proposer actor, got %q", events[0].Actor)
+	}
+	for _, e := range events[1:] {
+		if e.Actor != "auto-safe" {
+			t.Errorf("execution events should record actor auto-safe, got %q", e.Actor)
+		}
 	}
 	for _, e := range events {
-		if e.Actor != "auto-safe" {
-			t.Errorf("auto-safe path should record actor auto-safe, got %q", e.Actor)
-		}
 		if e.Cluster != "prod-us" {
 			t.Errorf("event should carry the worker's cluster, got %q", e.Cluster)
 		}
 	}
 }
 
-func TestWorker_AutoSafe_NonReversibleNotAudited(t *testing.T) {
+// A non-reversible decision never executes, but it must still leave a durable
+// "proposed" record — the whole point of auditing the lifecycle, not just runs.
+func TestWorker_NonReversible_AuditsProposalOnly(t *testing.T) {
 	sink := &capturingSink{}
 	rec := &recordingExecutor{}
 	w := auditedWorker("prod-us", rec, sink)
 
-	// evict_and_move stays pending and never reaches the executor, so nothing
-	// should be audited.
 	w.processDecisions([]types.Decision{mkDecision("1", types.ActionEvictAndMove)})
 
-	if events := sink.snapshot(); len(events) != 0 {
-		t.Errorf("non-reversible action must not be executed or audited, got %d events", len(events))
+	events := sink.snapshot()
+	if len(events) != 1 || events[0].Phase != audit.PhaseProposed {
+		t.Fatalf("non-reversible action should audit exactly one proposed event, got %+v", events)
+	}
+	if rec.count() != 0 {
+		t.Errorf("non-reversible action must not execute, got %d calls", rec.count())
+	}
+}
+
+// The proposal record is deduplicated by problem signature within the cooldown
+// window, so a per-tick re-analysis (fresh IDs, same problem) can't flood the log.
+func TestWorker_Proposed_DedupedWithinWindow(t *testing.T) {
+	sink := &capturingSink{}
+	rec := &recordingExecutor{}
+	// auto off so we isolate proposal logging from execution events.
+	w := NewClusterWorker("c", nil, nil, rec, false, time.Minute, sink)
+
+	w.processDecisions([]types.Decision{mkDecision("1", types.ActionEvictAndMove)})
+	w.processDecisions([]types.Decision{mkDecision("2", types.ActionEvictAndMove)}) // same problem, new ID
+
+	if events := sink.snapshot(); len(events) != 1 {
+		t.Errorf("same problem within the window should be proposed once, got %d events", len(events))
 	}
 }

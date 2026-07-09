@@ -45,7 +45,7 @@ func statusOf(t *testing.T, w *ClusterWorker, id string) types.DecisionStatus {
 
 func TestWorker_AutoOff_LeavesPending(t *testing.T) {
 	rec := &recordingExecutor{}
-	w := NewClusterWorker("c", nil, nil, rec, false, time.Minute)
+	w := NewClusterWorker("c", nil, nil, rec, false, time.Minute, nil)
 
 	w.processDecisions([]types.Decision{mkDecision("1", types.ActionScaleDown)})
 
@@ -59,7 +59,7 @@ func TestWorker_AutoOff_LeavesPending(t *testing.T) {
 
 func TestWorker_AutoOn_ExecutesReversible(t *testing.T) {
 	rec := &recordingExecutor{}
-	w := NewClusterWorker("c", nil, nil, rec, true, time.Minute)
+	w := NewClusterWorker("c", nil, nil, rec, true, time.Minute, nil)
 
 	w.processDecisions([]types.Decision{mkDecision("1", types.ActionScaleDown)})
 
@@ -73,7 +73,7 @@ func TestWorker_AutoOn_ExecutesReversible(t *testing.T) {
 
 func TestWorker_AutoOn_SkipsEvict(t *testing.T) {
 	rec := &recordingExecutor{}
-	w := NewClusterWorker("c", nil, nil, rec, true, time.Minute)
+	w := NewClusterWorker("c", nil, nil, rec, true, time.Minute, nil)
 
 	w.processDecisions([]types.Decision{mkDecision("1", types.ActionEvictAndMove)})
 
@@ -87,7 +87,7 @@ func TestWorker_AutoOn_SkipsEvict(t *testing.T) {
 
 func TestWorker_Cooldown_SuppressesRepeat(t *testing.T) {
 	rec := &recordingExecutor{}
-	w := NewClusterWorker("c", nil, nil, rec, true, time.Minute)
+	w := NewClusterWorker("c", nil, nil, rec, true, time.Minute, nil)
 
 	// Same problem recurs on a later tick (different decision ID, same target).
 	w.processDecisions([]types.Decision{mkDecision("1", types.ActionScaleDown)})
@@ -104,7 +104,7 @@ func TestWorker_Cooldown_SuppressesRepeat(t *testing.T) {
 
 func TestWorker_Cooldown_ExpiresAfterWindow(t *testing.T) {
 	rec := &recordingExecutor{}
-	w := NewClusterWorker("c", nil, nil, rec, true, 10*time.Millisecond)
+	w := NewClusterWorker("c", nil, nil, rec, true, 10*time.Millisecond, nil)
 
 	w.processDecisions([]types.Decision{mkDecision("1", types.ActionScaleDown)})
 	time.Sleep(20 * time.Millisecond) // let the cooldown window elapse

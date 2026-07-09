@@ -28,6 +28,15 @@ type applyModel struct {
 	quitting   bool
 }
 
+// startExec records the operator's approval to the audit trail, then returns the
+// command that runs the current decision. Approvals and rejections are the human
+// gates; executions themselves are audited inside the executor.
+func (m applyModel) startExec() tea.Cmd {
+	d := m.session.current()
+	m.sink.Record(audit.Lifecycle("interactive-review", audit.PhaseApproved, "", &d))
+	return runExecutor(m.exec, d)
+}
+
 // autoAdvance kicks off the next decision automatically when auto mode is on and
 // the current action is reversible. It is called at every idle transition (after
 // a toggle, an execution, or a manual reject/skip) so auto mode walks the queue
@@ -36,7 +45,7 @@ type applyModel struct {
 func (m applyModel) autoAdvance() (applyModel, tea.Cmd) {
 	if m.auto && !m.working && !m.session.done() && isReversible(m.session.current().Action) {
 		m.working = true
-		return m, runExecutor(m.exec, m.session.current())
+		return m, m.startExec()
 	}
 	return m, nil
 }
@@ -78,7 +87,7 @@ func (m applyModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.approveAll {
 			m.working = true
-			return m, runExecutor(m.exec, m.session.current())
+			return m, m.startExec()
 		}
 		return m.autoAdvance()
 
@@ -94,11 +103,11 @@ func (m applyModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.autoAdvance()
 		case "a", "y":
 			m.working = true
-			return m, runExecutor(m.exec, m.session.current())
+			return m, m.startExec()
 		case "A":
 			m.approveAll = true
 			m.working = true
-			return m, runExecutor(m.exec, m.session.current())
+			return m, m.startExec()
 		case "r", "n":
 			// A rejection produces no execution, so the executor's audit path never
 			// sees it. Record it here so the durable trail shows the operator's call.

@@ -129,7 +129,9 @@ const auditBackups = 5
 func buildAuditSink(path string, maxBytes int64) (audit.Sink, *audit.MemorySink, string, error) {
 	mem := audit.NewMemorySink(1000)
 	if path == "" {
-		return mem, mem, ui.DimStyle.Render("off (in-memory only; /api/audit live)"), nil
+		// HashingSink outermost so the in-memory trail (served at /api/audit) is
+		// tamper-evident too, not just the file.
+		return audit.NewHashingSink(mem), mem, ui.DimStyle.Render("off (in-memory only; /api/audit live)"), nil
 	}
 	file, err := audit.NewFileSink(path, true, maxBytes, auditBackups)
 	if err != nil {
@@ -139,7 +141,9 @@ func buildAuditSink(path string, maxBytes int64) (audit.Sink, *audit.MemorySink,
 	if maxBytes > 0 {
 		label += ui.DimStyle.Render(fmt.Sprintf(" (rotate >%d bytes, keep %d)", maxBytes, auditBackups))
 	}
-	return audit.NewMultiSink(file, mem), mem, label, nil
+	// Hash-chain the whole stream once, then fan out to file + memory so both hold
+	// the same verifiable sequence (see audit.VerifyChain / `courtvision audit-verify`).
+	return audit.NewHashingSink(audit.NewMultiSink(file, mem)), mem, label, nil
 }
 
 // execDoneMsg is delivered to a Bubbletea model when an executor call finishes.

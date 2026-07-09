@@ -32,6 +32,7 @@ to different nodes, or scale deployments.`,
 	rootCmd.AddCommand(multiMonitorCmd())
 	rootCmd.AddCommand(analyzeCmd())
 	rootCmd.AddCommand(statusCmd())
+	rootCmd.AddCommand(auditVerifyCmd())
 	rootCmd.AddCommand(versionCmd())
 
 	// If no subcommand provided, launch interactive REPL
