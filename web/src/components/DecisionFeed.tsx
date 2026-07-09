@@ -110,7 +110,13 @@ function DecisionCard({ decision, isNew }: { decision: Decision; isNew: boolean 
   )
 }
 
-export default function DecisionFeed() {
+export default function DecisionFeed({
+  decisionsUrl,
+  eventsUrl,
+}: {
+  decisionsUrl: string
+  eventsUrl: string
+}) {
   const [decisions, setDecisions] = useState<Decision[]>([])
   const [connected, setConnected] = useState(false)
   // newIds drives the one-shot slide-in animation. It lives in state (not a ref)
@@ -121,23 +127,29 @@ export default function DecisionFeed() {
   const [newIds, setNewIds] = useState<Set<string>>(new Set())
   const seenIdsRef = useRef<Set<string>>(new Set())
 
-  // Fetch historical decisions on mount
+  // Fetch the historical decisions for the current scope. The parent remounts
+  // this component (via key) on a scope switch, so state starts clean and we
+  // don't have to reset it here.
   useEffect(() => {
-    fetch('/api/decisions')
+    let active = true
+    fetch(decisionsUrl)
       .then((r) => r.json())
       .then((data: Decision[]) => {
-        if (Array.isArray(data)) {
+        if (active && Array.isArray(data)) {
           const ordered = data.slice().reverse()
           ordered.forEach((d) => seenIdsRef.current.add(d.id))
           setDecisions(ordered)
         }
       })
       .catch(console.error)
-  }, [])
+    return () => {
+      active = false
+    }
+  }, [decisionsUrl])
 
-  // SSE for real-time decisions
+  // SSE for real-time decisions (re-subscribes when the scope changes).
   useEffect(() => {
-    const es = new EventSource('/api/events')
+    const es = new EventSource(eventsUrl)
 
     es.addEventListener('connected', () => setConnected(true))
 
@@ -176,7 +188,7 @@ export default function DecisionFeed() {
     es.onopen = () => setConnected(true)
 
     return () => es.close()
-  }, [])
+  }, [eventsUrl])
 
   return (
     <div>

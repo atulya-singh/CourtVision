@@ -145,13 +145,13 @@ a cluster. Executions only for now (not propose/approve/reject); see
 ### `internal/ui/` — `styles.go`: lipgloss styles, banner, badges (shared by all TUIs).
 
 ### `web/` — React + TypeScript + Vite dashboard
-- `src/components/` — `Dashboard.tsx`, `ClusterOverview.tsx`, `DecisionFeed.tsx`. **Read-only viewer** (no approve/reject buttons; `DecisionFeed` fetches `/api/decisions` + subscribes to `/api/events`, and a pending card just shows "awaiting CLI/auto-safe"). **Still targets the single-cluster `/api/*` routes** — not yet aware of `/api/clusters/...` (open roadmap item).
+- `src/components/` — `Dashboard.tsx`, `ClusterOverview.tsx`, `DecisionFeed.tsx`; `src/scope.ts` (scope model + `endpointsFor`). **Read-only viewer** (no approve/reject buttons; a pending card just shows "awaiting CLI/auto-safe"). **Multi-cluster-aware**: `Dashboard` probes `GET /api/clusters` on mount (404 → single-cluster, renders the classic `/api/*` view; 200 → multi-cluster, renders a Fleet tab + one tab per worker). `endpointsFor(scope)` maps the selected scope to the `{snapshot,decisions,events}` URLs — a cluster tab hits `/api/clusters/{name}/...`, Fleet/single hit `/api/*`. `ClusterOverview`/`DecisionFeed`/`StatsBar` take their data URL as a prop and are remounted via `key` on a scope switch (clean reset, no setState-in-effect). The Fleet view shows a clickable `FleetSummary` roll-up + the coordinator's cross-cluster decisions.
 
 ---
 
 ## Known gaps / deliberate non-goals (see README Roadmap)
 - Coordinator (cross-cluster) decisions are **advisory / read-only** — surfaced but with no execution path of their own; non-reversible actions stay manual (no full-auto tier).
-- Dashboard is **read-only** (view metrics + decisions; no mutation) and not multi-cluster-aware yet.
+- Dashboard is **read-only** (view metrics + decisions; no mutation). It is now multi-cluster-aware (Fleet + per-cluster tabs via `/api/clusters/...`).
 - Store is in-memory. Executions can be persisted with `--audit-log` (JSONL,
   `internal/audit/`), but decision *lifecycle* events (propose/approve/reject),
   log rotation, and a read API are still open.

@@ -103,20 +103,26 @@ function NodeCard({ node, pods }: { node: NodeMetrics; pods: PodMetrics[] }) {
   )
 }
 
-export default function ClusterOverview() {
+export default function ClusterOverview({ snapshotUrl }: { snapshotUrl: string }) {
   const [snapshot, setSnapshot] = useState<ClusterSnapshot | null>(null)
 
   useEffect(() => {
+    let active = true
     const fetchCluster = () => {
-      fetch('/api/cluster')
+      fetch(snapshotUrl)
         .then((r) => r.json())
-        .then(setSnapshot)
+        .then((data) => {
+          if (active) setSnapshot(data)
+        })
         .catch(console.error)
     }
     fetchCluster()
     const interval = setInterval(fetchCluster, 3000)
-    return () => clearInterval(interval)
-  }, [])
+    return () => {
+      active = false
+      clearInterval(interval)
+    }
+  }, [snapshotUrl])
 
   if (!snapshot) {
     return (
