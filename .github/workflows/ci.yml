@@ -69,6 +69,10 @@ jobs:
         working-directory: web
         run: npm ci
 
+      - name: Lint
+        working-directory: web
+        run: npm run lint
+
       # Typechecks (tsc -b) and compiles the dashboard (vite build). Catches the
       # kind of TS regression we would otherwise only find by running tsc by hand.
       - name: Typecheck & build

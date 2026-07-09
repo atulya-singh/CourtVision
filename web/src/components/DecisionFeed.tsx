@@ -113,7 +113,13 @@ function DecisionCard({ decision, isNew }: { decision: Decision; isNew: boolean 
 export default function DecisionFeed() {
   const [decisions, setDecisions] = useState<Decision[]>([])
   const [connected, setConnected] = useState(false)
-  const newIdsRef = useRef<Set<string>>(new Set())
+  // newIds drives the one-shot slide-in animation. It lives in state (not a ref)
+  // so the render can read it without accessing a ref during render. seenIdsRef,
+  // by contrast, is only ever touched inside the SSE handler (an event handler,
+  // where reading a ref is fine) to tell a brand-new decision apart from a
+  // status update to one we already have.
+  const [newIds, setNewIds] = useState<Set<string>>(new Set())
+  const seenIdsRef = useRef<Set<string>>(new Set())
 
   // Fetch historical decisions on mount
   useEffect(() => {
@@ -121,7 +127,9 @@ export default function DecisionFeed() {
       .then((r) => r.json())
       .then((data: Decision[]) => {
         if (Array.isArray(data)) {
-          setDecisions(data.slice().reverse())
+          const ordered = data.slice().reverse()
+          ordered.forEach((d) => seenIdsRef.current.add(d.id))
+          setDecisions(ordered)
         }
       })
       .catch(console.error)
@@ -138,6 +146,9 @@ export default function DecisionFeed() {
     // upsert by id: replace the card if we already have it, otherwise prepend.
     es.addEventListener('decision', (e) => {
       const decision: Decision = JSON.parse(e.data)
+      const isNew = !seenIdsRef.current.has(decision.id)
+      seenIdsRef.current.add(decision.id)
+
       setDecisions((prev) => {
         const idx = prev.findIndex((d) => d.id === decision.id)
         if (idx >= 0) {
@@ -145,10 +156,20 @@ export default function DecisionFeed() {
           next[idx] = decision
           return next
         }
-        newIdsRef.current.add(decision.id)
-        setTimeout(() => newIdsRef.current.delete(decision.id), 600)
         return [decision, ...prev]
       })
+
+      // Only brand-new decisions animate in; status updates just re-render.
+      if (isNew) {
+        setNewIds((prev) => new Set(prev).add(decision.id))
+        setTimeout(() => {
+          setNewIds((prev) => {
+            const next = new Set(prev)
+            next.delete(decision.id)
+            return next
+          })
+        }, 600)
+      }
     })
 
     es.onerror = () => setConnected(false)
@@ -178,7 +199,7 @@ export default function DecisionFeed() {
             <DecisionCard
               key={d.id}
               decision={d}
-              isNew={newIdsRef.current.has(d.id)}
+              isNew={newIds.has(d.id)}
             />
           ))
         )}
