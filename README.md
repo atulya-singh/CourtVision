@@ -72,7 +72,7 @@ The two loops are independently tunable (`--interval` for workers, `--coordinato
 - **Real Kubernetes integration** — connects to any cluster via kubeconfig (AWS EKS, GKE, AKS, Minikube, Kind)
 - **Multi-cluster, multi-agent** — one subagent per cluster plus a master coordinator for cross-cluster reasoning, all in a single process
 - **Local LLM analysis** — uses Ollama with Llama 3 for on-device inference, no data leaves your machine
-- **Interactive CLI** — styled terminal interface with REPL mode, colored output, and spinners
+- **Interactive CLI** — styled REPL with a `/` command palette (filter, arrow-navigate, Tab-complete) and switchable session modes, plus colored output and spinners
 - **Real-time dashboard** — React frontend with glassmorphism UI, live metric visualization, and SSE-powered decision feed
 - **Mock mode** — full demo experience without a cluster or LLM, using simulated metrics with a noisy neighbor scenario
 - **Dry-run by default** — decisions are proposed and displayed but never executed unless explicitly enabled
@@ -114,25 +114,41 @@ kubectl patch deployment metrics-server -n kube-system --type='json' \
 courtvision
 ```
 
-This drops you into the CourtVision REPL where you can type commands directly:
+This drops you into the CourtVision REPL. Press **`/`** to open a command
+palette (à la Claude Code) — a live-filtered, arrow-navigable menu you drive with
+almost no typing — and switch **session modes** once instead of re-typing flags:
 
 ```
 ◈ CourtVision v1.0.0
 
-› status
-  Ollama:     ✓ Connected (http://localhost:11434)
-  Models:     llama3:latest
-  Kubernetes: ✓ Connected (kind-kind)
+  ● ollama · metrics:mock · ns:all · sandbox
+› /                      ← press "/" to open the palette
+  ▸ /analyze             Run a one-shot cluster analysis
+    /review              Analyze, then approve/reject each action inline
+    /metrics <mock|k8s>  Switch the metrics source for this session
+    /namespace <ns|all>  Set the namespace filter for this session
+    …                    (↑/↓ move · Tab complete · Enter run · Esc dismiss)
+```
 
-› analyze --metrics k8s --namespace default --output table
-  Analyzing cluster... ⠋
+- **Palette** — type `/` then filter (`/an` → `/analyze`); `↑/↓` highlight,
+  `Tab` completes, `Enter` runs, `Esc` dismisses. `↑/↓` still cycle command
+  history when the palette is closed.
+- **Modes** — `/metrics k8s`, `/namespace kube-system`, or **`Shift+Tab`** to
+  toggle mock↔k8s. The mode bar above the prompt always shows the current context,
+  and `/review` / `/analyze` run under it (no repeated `--metrics`/`--namespace`).
+- **Back-compat** — bare words (`review`, `status`, `help`, `exit`) still work.
+  Long-running servers (`/monitor`, `/multi-monitor`) print the shell command to
+  run rather than taking over the REPL. The REPL `review` flow is a **sandbox**
+  (k8s falls back to dry-run), so switching `/metrics k8s` never mutates a cluster.
 
-  SEVERITY   POD                          ACTION          REASONING
-  ──────────  ─────────────────────────────  ───────────────  ──────────────────────────────────────────
-  critical   data-pipeline-545bf66bc6     patch_limits    Pod consuming 100% of CPU limit, recomm...
-  medium     worker-queue-5f8d            none            Memory elevated at 78%, monitoring...
-
-  Found 2 issues in default (analyzed in 3.2s)
+```
+› /review
+  Analyzing cluster...
+  Review 1/2  [critical]
+  Pod:    default/data-pipeline-545bf66bc6
+  Action: patch_limits
+  Why:    Pod consuming 100% of CPU limit, recommend raising the ceiling
+  [a]pprove  [r]eject  [s]kip  [A]pprove all  [tab] auto: off  [q]uit
 
 › exit
 ```

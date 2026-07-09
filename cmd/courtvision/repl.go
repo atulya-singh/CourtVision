@@ -97,6 +97,17 @@ type replModel struct {
 	width     int
 	quitting  bool
 
+	// session modes: the operational context the next command runs under, set
+	// once with /metrics or /namespace instead of re-typed as flags each time.
+	metrics   string // "mock" | "k8s"
+	namespace string // "" = all namespaces
+
+	// slash-command palette (the "/…" dropdown). Open while the input starts
+	// with "/"; paletteItems is the current filtered set, paletteIdx the highlight.
+	paletteOpen  bool
+	paletteItems []slashCommand
+	paletteIdx   int
+
 	// review-mode state
 	mode      replMode
 	session   *reviewSession
@@ -131,6 +142,7 @@ func newREPL(rootCmd *cobra.Command) replModel {
 		history:   []string{},
 		histIdx:   -1,
 		width:     80,
+		metrics:   "mock",
 	}
 }
 
@@ -170,7 +182,31 @@ func (m replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.quitting = true
 			return m, tea.Quit
 
+		case tea.KeyShiftTab:
+			// Quick mode switch: cycle metrics mock<->k8s, mirroring Claude Code's
+			// Shift+Tab mode toggle.
+			return m.toggleMetrics(), nil
+
+		case tea.KeyEsc:
+			m.paletteOpen = false
+			return m, nil
+
+		case tea.KeyTab:
+			// Complete the highlighted palette entry into the input line.
+			if m.paletteOpen && len(m.paletteItems) > 0 {
+				return m.completeSelected(), nil
+			}
+			return m, nil
+
 		case tea.KeyUp:
+			// While the palette is open ↑/↓ move the highlight; otherwise they
+			// cycle command history exactly as before.
+			if m.paletteOpen {
+				if m.paletteIdx > 0 {
+					m.paletteIdx--
+				}
+				return m, nil
+			}
 			if len(m.history) > 0 {
 				if m.histIdx == -1 {
 					m.histIdx = len(m.history) - 1
@@ -183,6 +219,12 @@ func (m replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 
 		case tea.KeyDown:
+			if m.paletteOpen {
+				if m.paletteIdx < len(m.paletteItems)-1 {
+					m.paletteIdx++
+				}
+				return m, nil
+			}
 			if m.histIdx != -1 {
 				if m.histIdx < len(m.history)-1 {
 					m.histIdx++
@@ -197,8 +239,14 @@ func (m replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case tea.KeyEnter:
 			input := strings.TrimSpace(m.textInput.Value())
+			// With the palette open, Enter runs the highlighted command (keeping
+			// any args the operator already typed after the command word).
+			if m.paletteOpen && len(m.paletteItems) > 0 {
+				input = m.paletteChoice(input)
+			}
 			m.textInput.SetValue("")
 			m.histIdx = -1
+			m.paletteOpen = false
 
 			if input == "" {
 				return m, nil
@@ -214,45 +262,158 @@ func (m replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				lipgloss.NewStyle().Foreground(ui.White).Render(input)
 			m.output = append(m.output, echoLine)
 
-			// Handle exit/quit
-			if input == "exit" || input == "quit" {
-				m.quitting = true
-				return m, tea.Quit
-			}
+			return m.dispatch(input)
 
-			// Handle help
-			if input == "help" {
-				m.output = append(m.output, renderHelp())
-				return m, nil
-			}
-
-			// Handle clear
-			if input == "clear" {
-				m.output = nil
-				return m, nil
-			}
-
-			// Handle interactive review: analyze the cluster, then step through
-			// the proposed actions inline. Runs in this same program (no nested
-			// TUI), which is why it lives here instead of as a cobra command.
-			fields := strings.Fields(input)
-			if fields[0] == "review" {
-				m.output = append(m.output, ui.DimStyle.Render("  Analyzing cluster..."))
-				return m, startReview(fields[1:])
-			}
-
-			// Execute subcommand and refresh status
-			result := executeCommand(m.rootCmd, input)
-			if result != "" {
-				m.output = append(m.output, result)
-			}
-			return m, checkConnStatus
+		default:
+			// Any other key edits the input; refresh the palette from the new value.
+			var cmd tea.Cmd
+			m.textInput, cmd = m.textInput.Update(msg)
+			return m.refreshPalette(), cmd
 		}
 	}
 
 	var cmd tea.Cmd
 	m.textInput, cmd = m.textInput.Update(msg)
 	return m, cmd
+}
+
+// ── Slash-command dispatch + palette helpers ────────────────────────────────
+
+// dispatch routes one submitted line (typed or picked from the palette) to the
+// right handler. A leading "/" is optional and bare words still resolve, so old
+// history entries and muscle memory keep working. It returns the updated model
+// and any command to run.
+func (m replModel) dispatch(raw string) (replModel, tea.Cmd) {
+	fields := strings.Fields(strings.TrimPrefix(strings.TrimSpace(raw), "/"))
+	if len(fields) == 0 {
+		return m, nil
+	}
+	name, rest := fields[0], fields[1:]
+
+	c, ok := lookupSlash(name)
+	if !ok {
+		m.output = append(m.output,
+			errorStyle.Render("  Unknown command: "+name)+"\n"+
+				ui.DimStyle.Render("  Press / to open the command palette, or type help"))
+		return m, nil
+	}
+
+	switch c.kind {
+	case metaExit:
+		m.quitting = true
+		return m, tea.Quit
+	case metaHelp:
+		m.output = append(m.output, renderHelp())
+		return m, nil
+	case metaClear:
+		m.output = nil
+		return m, nil
+	case setMetrics:
+		return m.applyMetrics(rest), nil
+	case setNamespace:
+		return m.applyNamespace(rest), nil
+	case inlineReview:
+		// Analyze the cluster, then step through the proposed actions inline.
+		// Runs in this same program (no nested TUI), using the session mode.
+		m.output = append(m.output, ui.DimStyle.Render("  Analyzing cluster..."))
+		return m, startReview(m.metrics, m.namespace)
+	case externalCmd:
+		m.output = append(m.output, externalHint(c, m.metrics, m.namespace))
+		return m, nil
+	default: // cobraCmd
+		result := executeCommand(m.rootCmd, cobraArgsFor(c, m.metrics, m.namespace, rest))
+		if result != "" {
+			m.output = append(m.output, result)
+		}
+		return m, checkConnStatus
+	}
+}
+
+// refreshPalette recomputes the dropdown from the current input value: open and
+// filtered while the line starts with "/", closed otherwise.
+func (m replModel) refreshPalette() replModel {
+	val := strings.TrimSpace(m.textInput.Value())
+	if !strings.HasPrefix(val, "/") {
+		m.paletteOpen = false
+		m.paletteItems = nil
+		m.paletteIdx = 0
+		return m
+	}
+	if !m.paletteOpen {
+		m.paletteIdx = 0 // fresh open starts at the top
+	}
+	m.paletteItems = matchSlash(val)
+	m.paletteOpen = true
+	if m.paletteIdx >= len(m.paletteItems) {
+		m.paletteIdx = len(m.paletteItems) - 1
+	}
+	if m.paletteIdx < 0 {
+		m.paletteIdx = 0
+	}
+	return m
+}
+
+// completeSelected fills the input with the highlighted command, leaving a
+// trailing space when it takes arguments so the operator can keep typing.
+func (m replModel) completeSelected() replModel {
+	c := m.paletteItems[m.paletteIdx]
+	val := "/" + c.name
+	if c.args != "" {
+		val += " "
+	}
+	m.textInput.SetValue(val)
+	m.textInput.CursorEnd()
+	return m.refreshPalette()
+}
+
+// paletteChoice resolves what Enter should run when the palette is open: the
+// highlighted command, but preserving any args already typed after the word.
+func (m replModel) paletteChoice(input string) string {
+	c := m.paletteItems[m.paletteIdx]
+	fields := strings.Fields(strings.TrimPrefix(input, "/"))
+	if len(fields) >= 2 {
+		return "/" + c.name + " " + strings.Join(fields[1:], " ")
+	}
+	return "/" + c.name
+}
+
+// ── Session mode switching ──────────────────────────────────────────────────
+
+func (m replModel) toggleMetrics() replModel {
+	if m.metrics == "k8s" {
+		m.metrics = "mock"
+	} else {
+		m.metrics = "k8s"
+	}
+	m.output = append(m.output, ui.GreenStyle.Render("  metrics → "+m.metrics)+
+		ui.DimStyle.Render("  (Shift+Tab to toggle)"))
+	return m
+}
+
+func (m replModel) applyMetrics(rest []string) replModel {
+	if len(rest) == 0 {
+		m.output = append(m.output, ui.DimStyle.Render("  metrics is "+m.metrics+"  (usage: /metrics mock|k8s)"))
+		return m
+	}
+	v := strings.ToLower(rest[0])
+	if v != "mock" && v != "k8s" {
+		m.output = append(m.output, errorStyle.Render("  metrics must be 'mock' or 'k8s'"))
+		return m
+	}
+	m.metrics = v
+	m.output = append(m.output, ui.GreenStyle.Render("  metrics → "+v))
+	return m
+}
+
+func (m replModel) applyNamespace(rest []string) replModel {
+	if len(rest) == 0 || strings.EqualFold(rest[0], "all") {
+		m.namespace = ""
+		m.output = append(m.output, ui.GreenStyle.Render("  namespace → all"))
+		return m
+	}
+	m.namespace = rest[0]
+	m.output = append(m.output, ui.GreenStyle.Render("  namespace → "+rest[0]))
+	return m
 }
 
 // ── Interactive review (in-REPL approval flow) ──────────────────────────────
@@ -266,28 +427,11 @@ type reviewLoadedMsg struct {
 }
 
 // startReview analyzes the cluster off the UI thread and hands the proposed
-// decisions back as a message. For safety the REPL never mutates a real cluster:
-// mock metrics get a simulated executor, while k8s falls back to dry-run. Real
-// changes are reserved for `analyze --apply` and the monitor, which ask for it
-// explicitly.
-func startReview(args []string) tea.Cmd {
-	metricsSource := "mock"
-	namespace := ""
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--metrics":
-			if i+1 < len(args) {
-				metricsSource = args[i+1]
-				i++
-			}
-		case "--namespace":
-			if i+1 < len(args) {
-				namespace = args[i+1]
-				i++
-			}
-		}
-	}
-
+// decisions back as a message, using the session's metrics/namespace mode. For
+// safety the REPL never mutates a real cluster: mock metrics get a simulated
+// executor, while k8s falls back to dry-run. Real changes are reserved for
+// `analyze --apply` and the monitor, which ask for it explicitly.
+func startReview(metricsSource, namespace string) tea.Cmd {
 	return func() tea.Msg {
 		provider, err := makeProvider(metricsSource, namespace)
 		if err != nil {
@@ -448,6 +592,16 @@ func (m replModel) View() string {
 		return b.String()
 	}
 
+	// ── Command palette (dropdown while typing "/…") ──────────────────────
+	if m.paletteOpen {
+		b.WriteString(renderPalette(m.paletteItems, m.paletteIdx))
+		b.WriteString("\n")
+	}
+
+	// ── Mode bar (current session context, above the prompt) ──────────────
+	b.WriteString(m.renderModeBar())
+	b.WriteString("\n")
+
 	// ── Input box (always at the bottom) ──────────────────────────────────
 	boxWidth := m.width - 2
 	if boxWidth < 30 {
@@ -481,6 +635,8 @@ func (m replModel) View() string {
 
 // ── Help renderer ─────────────────────────────────────────────────────────────
 
+// renderHelp lists every command from the shared registry, so it can never drift
+// from the palette.
 func renderHelp() string {
 	var b strings.Builder
 	headerStyle := lipgloss.NewStyle().
@@ -490,40 +646,47 @@ func renderHelp() string {
 	nameStyle := lipgloss.NewStyle().
 		Foreground(ui.Cyan).
 		Bold(true).
-		Width(10)
+		Width(22)
 
 	descStyle := lipgloss.NewStyle().
 		Foreground(ui.Gray)
 
-	b.WriteString(headerStyle.Render("  Available Commands:"))
+	b.WriteString(headerStyle.Render("  Commands ") + ui.DimStyle.Render("(type / to open the palette)"))
 	b.WriteString("\n")
 
-	commands := []struct{ name, desc string }{
-		{"monitor", "Start the monitoring agent"},
-		{"analyze", "Run a one-shot cluster analysis"},
-		{"review", "Analyze, then approve/reject each action inline"},
-		{"status", "Check connectivity to Ollama and Kubernetes"},
-		{"version", "Print version information"},
-		{"clear", "Clear output"},
-		{"help", "Show this help message"},
-		{"exit", "Exit the REPL (also: quit, Ctrl+C)"},
-	}
-
-	for _, c := range commands {
+	for _, c := range slashCommands() {
 		b.WriteString(fmt.Sprintf("    %s %s\n",
-			nameStyle.Render(c.name),
+			nameStyle.Render(slashLabel(c)),
 			descStyle.Render(c.desc),
 		))
 	}
 
-	b.WriteString(ui.DimStyle.Render("  Tip: ↑/↓ arrows cycle through command history"))
+	b.WriteString(ui.DimStyle.Render("  ↑/↓ history · Shift+Tab toggle metrics · Tab complete · Esc dismiss"))
 	return b.String()
+}
+
+// renderModeBar shows the live session context — connectivity plus the metrics
+// source and namespace filter the next command will run under — so the current
+// "mode" is always visible above the prompt.
+func (m replModel) renderModeBar() string {
+	ollamaDot := statusDotRed
+	if m.status.ollamaOK {
+		ollamaDot = statusDotGreen
+	}
+	ns := m.namespace
+	if ns == "" {
+		ns = "all"
+	}
+	sep := statusBarStyle.Render(" · ")
+	return "  " + ollamaDot + statusBarStyle.Render(" ollama") + sep +
+		statusBarStyle.Render("metrics:") + ui.CyanStyle.Render(m.metrics) + sep +
+		statusBarStyle.Render("ns:") + ui.CyanStyle.Render(ns) + sep +
+		statusBarStyle.Render("sandbox")
 }
 
 // ── Command executor ──────────────────────────────────────────────────────────
 
-func executeCommand(rootCmd *cobra.Command, input string) string {
-	args := strings.Fields(input)
+func executeCommand(rootCmd *cobra.Command, args []string) string {
 	if len(args) == 0 {
 		return ""
 	}
@@ -532,7 +695,7 @@ func executeCommand(rootCmd *cobra.Command, input string) string {
 	cmd, _, err := rootCmd.Find(args)
 	if err != nil || cmd == rootCmd {
 		return errorStyle.Render(fmt.Sprintf("  Unknown command: %s", args[0])) +
-			"\n" + ui.DimStyle.Render("  Type \"help\" to see available commands")
+			"\n" + ui.DimStyle.Render("  Press / to see available commands")
 	}
 
 	// Capture stdout
@@ -585,7 +748,7 @@ func printStartupBanner() {
 		ollamaDot, statusBarStyle.Render(ollamaLabel),
 		k8sDot, statusBarStyle.Render(k8sLabel))
 	fmt.Println()
-	fmt.Println(ui.DimStyle.Render("  Type \"help\" for commands, \"exit\" to quit"))
+	fmt.Println(ui.DimStyle.Render("  Press / for the command palette · \"help\" for a list · \"exit\" to quit"))
 	fmt.Println()
 }
 
