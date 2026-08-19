@@ -102,7 +102,7 @@ courtvision
 ```
 
 This drops you into the CourtVision REPL. Press **`/`** to open a command
-palette (à la Claude Code) — a live-filtered, arrow-navigable menu you drive with
+palette — a live-filtered, arrow-navigable menu you drive with
 almost no typing — and switch **session modes** once instead of re-typing flags:
 
 ```
