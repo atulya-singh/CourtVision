@@ -4,19 +4,6 @@ An autonomous Kubernetes controller that uses a local LLM to analyze real-time c
 
 CourtVision runs in two shapes. **Single-cluster mode** watches one cluster with one agent. **Multi-agent mode** runs one subagent per cluster, each monitoring its own cluster in parallel, plus a master coordinator that reasons across the whole fleet — spotting cross-cluster opportunities like relieving an overloaded cluster by shifting work to one with spare capacity.
 
-## Performance
-
-Benchmarks run on Apple M-series (Go 1.22, `go test -bench=. -benchmem`):
-
-| Component | Throughput / Latency | Allocations |
-|-----------|----------------------|-------------|
-| Ring buffer write | 11.1 ns/op (~90M writes/sec) | 0 allocs |
-| Store `AddDecision` | 23.3 ns/op | 0 allocs |
-| Rule engine — 8 pods, 4 nodes | 10.6 µs/op (4.8 µs parallel) | — |
-| LLM response parser — 4 decisions | 8.0 µs/op | — |
-| REST + SSE API (50 concurrent) | 14,000+ req/s, p99 <0.5 ms | — |
-| Agent RSS (idle monitor loop) | ~25 MB | — |
-
 ## How It Works
 
 CourtVision runs a continuous monitoring loop that collects resource metrics from your Kubernetes cluster every few seconds, feeds them to a local LLM (Llama 3 via Ollama), and surfaces structured decisions through a REST API and real-time dashboard.
